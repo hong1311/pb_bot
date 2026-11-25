@@ -6,10 +6,10 @@ on:
     - cron: "25 14 * * 1-5"
   workflow_dispatch:
     inputs:
-      max_minutes: "135"
+      max_minutes:
         description: "Minutes to run (use 2 for quick test)"
         required: false
-        default: "2"
+        default: "135"
 
 permissions:
   contents: write
