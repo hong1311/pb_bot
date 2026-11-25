@@ -1,0 +1,52 @@
+name: PB Bot NY Session Paper Runner
+
+on:
+  schedule:
+    - cron: "25 13 * * 1-5"
+    - cron: "25 14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      max_minutes:
+        description: "Minutes to run (use 2 for quick test)"
+        required: false
+        default: "135"
+
+permissions:
+  contents: write
+
+jobs:
+  run-paper-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run PB Bot Paper Session
+        env:
+          WEBHOOK_URL: ${{ secrets.PB_WEBHOOK_URL }}
+        run: |
+          MAX_MINS="${{ github.event.inputs.max_minutes || '135' }}"
+          if [ -n "$WEBHOOK_URL" ]; then
+            python paper_runner.py --live --poll-sec 60 --ny-hours-only --max-minutes "$MAX_MINS" --log-dir paper_logs_live --webhook "$WEBHOOK_URL"
+          else
+            python paper_runner.py --live --poll-sec 60 --ny-hours-only --max-minutes "$MAX_MINS" --log-dir paper_logs_live
+          fi
+
+      - name: Save paper trade logs back to repo
+        run: |
+          mkdir -p paper_logs_live
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add paper_logs_live
+          git diff --staged --quiet || git commit -m "Update paper_logs_live ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+          git push
