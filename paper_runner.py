@@ -199,6 +199,7 @@ def poll_live_yfinance(
     lookback_days: int = 2,
     once: bool = False,
     ny_hours_only: bool = False,
+    max_minutes: Optional[float] = None,
     webhook_url: Optional[str] = None,
 ) -> None:
     try:
@@ -286,6 +287,7 @@ def main() -> None:
     parser.add_argument("--lookback-days", type=int, default=2, help="Warmup lookback days for --live")
     parser.add_argument("--once", action="store_true", help="Run a single poll cycle in --live mode and exit")
     parser.add_argument("--ny-hours-only", action="store_true", help="Only poll on weekdays between 09:25 and 11:35 ET")
+    parser.add_argument("--max-minutes", type=float, default=None, help="Stop cleanly after N minutes")
     parser.add_argument("--log-dir", type=Path, default=Path("paper_logs"))
     parser.add_argument("--pace-ms", type=float, default=0.0, help="Optional delay per 1m bar in ms")
     parser.add_argument("--webhook", type=str, default=None, help="Optional Discord/Slack webhook URL")
@@ -307,6 +309,7 @@ def main() -> None:
             lookback_days=args.lookback_days,
             once=args.once,
             ny_hours_only=args.ny_hours_only,
+            max_minutes=args.max_minutes,
             webhook_url=args.webhook,
         )
         return
