@@ -198,6 +198,7 @@ def poll_live_yfinance(
     poll_sec: float = 60.0,
     lookback_days: int = 2,
     once: bool = False,
+    ny_hours_only: bool = False,
     webhook_url: Optional[str] = None,
 ) -> None:
     try:
@@ -219,6 +220,13 @@ def poll_live_yfinance(
     )
 
     while True:
+        now_ny = datetime.now(NY_TZ)
+        if ny_hours_only and (now_ny.weekday() >= 5 or not (time(9, 25) <= now_ny.time() <= time(11, 35))):
+            if once:
+                print(f"[{now_ny.strftime('%Y-%m-%d %H:%M:%S %Z')}] Outside NY AM window; skipping (--ny-hours-only).", flush=True)
+                break
+            pytime.sleep(max(15.0, min(poll_sec, 60.0)))
+            continue
         now_utc = datetime.now(NY_TZ).astimezone(ZoneInfo("UTC")) if False else None
         from datetime import timezone
         now_u = datetime.now(timezone.utc)
@@ -277,6 +285,7 @@ def main() -> None:
     parser.add_argument("--poll-sec", type=float, default=60.0, help="Polling interval in seconds for --live")
     parser.add_argument("--lookback-days", type=int, default=2, help="Warmup lookback days for --live")
     parser.add_argument("--once", action="store_true", help="Run a single poll cycle in --live mode and exit")
+    parser.add_argument("--ny-hours-only", action="store_true", help="Only poll on weekdays between 09:25 and 11:35 ET")
     parser.add_argument("--log-dir", type=Path, default=Path("paper_logs"))
     parser.add_argument("--pace-ms", type=float, default=0.0, help="Optional delay per 1m bar in ms")
     parser.add_argument("--webhook", type=str, default=None, help="Optional Discord/Slack webhook URL")
@@ -297,6 +306,7 @@ def main() -> None:
             poll_sec=args.poll_sec,
             lookback_days=args.lookback_days,
             once=args.once,
+            ny_hours_only=args.ny_hours_only,
             webhook_url=args.webhook,
         )
         return
