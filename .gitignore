@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+data_cache/
+*.html
+paper_logs/
+paper_logs_live_test/
