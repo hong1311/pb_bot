@@ -199,8 +199,7 @@ def run_backtest(
         # First check fills/exits on incoming bar
         closed = broker.process_bar(nq_bar)
         if closed is not None:
-            if closed.pnl_dollars < 0:
-                engine.losses_today += 1
+            engine.on_trade_closed(closed)
             engine.active_position = None
             engine.risk.equity = broker.balance
         elif broker.position is not None and engine.active_position is None:
@@ -217,6 +216,7 @@ def run_backtest(
         if broker.position is not None and "pending_market_close_reason" in broker.position.metadata:
             closed = broker.process_bar(nq_bar)
             if closed is not None:
+                engine.on_trade_closed(closed)
                 engine.active_position = None
                 engine.risk.equity = broker.balance
 

@@ -145,8 +145,7 @@ def run_paper_replay(
     for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
         closed = broker.process_bar(nq_bar)
         if closed is not None:
-            if closed.pnl_dollars < 0:
-                engine.losses_today += 1
+            engine.on_trade_closed(closed)
             engine.active_position = None
             engine.risk.equity = broker.balance
         engine.on_1m_pair(nq_bar, es_bar)
@@ -248,8 +247,7 @@ def poll_live_yfinance(
         for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
             closed = broker.process_bar(nq_bar)
             if closed is not None:
-                if closed.pnl_dollars < 0:
-                    engine.losses_today += 1
+                engine.on_trade_closed(closed)
                 engine.active_position = None
                 engine.risk.equity = broker.balance
             if is_warmup:
@@ -299,6 +297,7 @@ def main() -> None:
         am_end=time(11, 30),
         entry_mode=EntryOrderMode.MARKET_ON_CLOSE,
         be_mode=BreakEvenMode.OFF,
+        enable_10am_macro_pause=True,
         allow_pm_session=args.allow_pm,
     )
     if args.live:

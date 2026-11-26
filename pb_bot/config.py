@@ -1,3 +1,4 @@
+from typing import Optional
 from dataclasses import dataclass, field
 from datetime import time
 from enum import Enum
@@ -43,6 +44,9 @@ class BotConfig:
     continuation_extreme_threshold: float = 0.705  # Deep premium/discount Fib threshold
     max_trades_per_day: int = 2             # 1-2 trades/day hard cap
     max_losses_per_day: int = 1             # Stop trading for the day after 1 stop-loss
+    max_wins_per_day: Optional[int] = None  # Optional cap (e.g., 1) to stop after hitting daily target
+    max_stop_pts: Optional[float] = None      # Reject overextended setups with SL wider than N points
+    enable_10am_macro_pause: bool = False     # Pause entries 09:55-10:10 NY around 10:00 USD releases
     min_rr: float = 1.0                     # Hard floor: reject < 1:1 RR
     max_target_rr: float = 2.5              # Avoid chasing distant >2.5R intraday targets
     strict_max_rr: bool = False             # When True, reject targets exceeding max_target_rr

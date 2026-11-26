@@ -70,6 +70,7 @@ class PBStrategyEngine:
         self._current_day = None
         self.trades_today: int = 0
         self.losses_today: int = 0
+        self.wins_today: int = 0
         self.am_5m_fvg_count: int = 0
         self.judas_manipulation_seen: bool = False
         self.day_invalidated_immediate_delivery: bool = False
@@ -79,6 +80,13 @@ class PBStrategyEngine:
 
     def _log_rejection(self, ts: datetime, code: str, detail: str) -> None:
         self.rejections.append(RejectionRecord(ts, code, detail))
+
+    def on_trade_closed(self, closed) -> None:
+        pnl = getattr(closed, 'pnl_dollars', 0.0)
+        if pnl < 0:
+            self.losses_today += 1
+        elif pnl > 0:
+            self.wins_today += 1
 
     def on_1m_pair(self, nq_bar: Bar, es_bar: Bar) -> Optional[OrderRequest]:
         ts = to_ny(nq_bar.timestamp)
@@ -90,6 +98,7 @@ class PBStrategyEngine:
             self._current_day = nq_sess.trading_day
             self.trades_today = 0
             self.losses_today = 0
+            self.wins_today = 0
             self.am_5m_fvg_count = 0
             self.judas_manipulation_seen = False
             self.day_invalidated_immediate_delivery = False
@@ -182,9 +191,19 @@ class PBStrategyEngine:
 
         if self.trades_today >= self.config.max_trades_per_day:
             return None
+        if self.config.max_wins_per_day is not None and self.wins_today >= self.config.max_wins_per_day:
+            if newly_confirmed_ifvgs:
+                self._log_rejection(ts, 'MAX_DAILY_WINS', f'Reached {self.wins_today} win(s) today')
+            return None
         if self.losses_today >= self.config.max_losses_per_day:
             if newly_confirmed_ifvgs:
                 self._log_rejection(ts, 'MAX_DAILY_LOSSES', f'Reached {self.losses_today} loss(es) today')
+            return None
+
+        # 10:00 AM ET USD red-folder macro buffer (Ep. 6 Time)
+        if self.config.enable_10am_macro_pause and time(9, 55) <= ts.time() <= time(10, 10):
+            if newly_confirmed_ifvgs:
+                self._log_rejection(ts, 'MACRO_10AM_PAUSE', '09:55-10:10 NY macro buffer')
             return None
 
         # Lunch accumulation hard block (12:00-13:00 NY)
@@ -336,6 +355,10 @@ class PBStrategyEngine:
             direction == Direction.BEARISH and stop_loss <= entry_price
         ):
             self._log_rejection(ts, "INVALID_SL_GEOMETRY", f"entry={entry_price} sl={stop_loss}")
+            return None
+
+        if self.config.max_stop_pts is not None and abs(entry_price - stop_loss) > self.config.max_stop_pts:
+            self._log_rejection(ts, "SL_TOO_WIDE", f"SL={abs(entry_price - stop_loss):.2f}pts > max {self.config.max_stop_pts:.1f}pts")
             return None
 
         dol_candidates = self.liquidity.collect_dol_targets(
