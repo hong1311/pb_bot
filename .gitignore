@@ -5,3 +5,5 @@ data_cache/
 *.html
 paper_logs/
 paper_logs_live_test/
+
+validation_results/
