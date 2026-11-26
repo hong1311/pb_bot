@@ -144,6 +144,7 @@ class BiasAndProfileEngine:
         session: DailySessionState,
         htf_fvgs_by_tf: Dict[str, List[FVG]],
         current_price: Optional[float] = None,
+        seek_override: Optional[bool] = None,
     ) -> BiasState:
         if self._current_day != session.trading_day:
             self.reset_for_new_day(session.trading_day)
@@ -171,12 +172,16 @@ class BiasAndProfileEngine:
             or (london_swept_both_asia and not clean_directional_expansion)
             or (session.asia.high_swept and session.asia.low_swept and conflicting_ny_cisds)
         )
+        if seek_override is not None:
+            is_sd_now = seek_override
         if is_sd_now:
             self.state.profile = DailyProfile.SEEK_AND_DESTROY
             self.state.seek_and_destroy_active = True
             self.state.notes = "BOTH_SIDES_SWEPT_NO_CLEAN_EXPANSION"
             return self.state
-        elif self.state.seek_and_destroy_active and clean_directional_expansion and not conflicting_ny_cisds:
+        elif self.state.seek_and_destroy_active and (seek_override is False or (clean_directional_expansion and not conflicting_ny_cisds)):
+            if seek_override is False:
+                self.state.profile = DailyProfile.UNKNOWN
             self.state.seek_and_destroy_active = False
             self.state.notes = "EXPANSION_CLEARED_SEEK_AND_DESTROY"
 

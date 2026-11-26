@@ -53,6 +53,8 @@ class SMTEvent:
     nq_price: float
     es_price: float
     kind: str                  # "SWING_SMT" or "KEY_LEVEL_SMT"
+    nq_pivot_at: Optional[datetime] = None
+    es_pivot_at: Optional[datetime] = None
 
 
 class SwingTracker:
@@ -138,7 +140,7 @@ class LiquidityTracker:
                 if (es_curr.price < es_prev.price and nq_curr.price >= nq_prev.price) or (
                     nq_curr.price < nq_prev.price and es_curr.price >= es_prev.price
                 ):
-                    evt = SMTEvent(ts, timeframe, Direction.BULLISH, nq_curr.price, es_curr.price, "SWING_SMT")
+                    evt = SMTEvent(ts, timeframe, Direction.BULLISH, nq_curr.price, es_curr.price, "SWING_SMT", nq_curr.timestamp, es_curr.timestamp)
                     key = (timeframe, Direction.BULLISH)
                     pair = (nq_prev.timestamp, nq_curr.timestamp, es_prev.timestamp, es_curr.timestamp)
                     if self._last_smt_pair.get(key) != pair:
@@ -154,7 +156,7 @@ class LiquidityTracker:
                 if (es_curr.price > es_prev.price and nq_curr.price <= nq_prev.price) or (
                     nq_curr.price > nq_prev.price and es_curr.price <= es_prev.price
                 ):
-                    evt = SMTEvent(ts, timeframe, Direction.BEARISH, nq_curr.price, es_curr.price, "SWING_SMT")
+                    evt = SMTEvent(ts, timeframe, Direction.BEARISH, nq_curr.price, es_curr.price, "SWING_SMT", nq_curr.timestamp, es_curr.timestamp)
                     key = (timeframe, Direction.BEARISH)
                     pair = (nq_prev.timestamp, nq_curr.timestamp, es_prev.timestamp, es_curr.timestamp)
                     if self._last_smt_pair.get(key) != pair:

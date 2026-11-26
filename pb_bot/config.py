@@ -31,6 +31,11 @@ class DiscretionMode(str, Enum):
     STRICT = "STRICT"    # Enforce structural range and displacement gates
 
 
+class RegimeMode(str, Enum):
+    OBSERVE = "OBSERVE"  # Audit the new market-regime gates
+    STRICT = "STRICT"    # Replace legacy regime gates with persistent range locks
+
+
 class PlaybookModel(str, Enum):
     MAC = "MAC"
     CONTINUATION = "CONTINUATION"
@@ -123,6 +128,11 @@ class BotConfig:
     enable_0930_judas_1m_override: bool = False
     max_candles_for_clean_inversion: int = 4  # >= 5 candles flagged as slow/choppy LRLR
 
+    regime_mode: RegimeMode = RegimeMode.OBSERVE
+    regime_require_calendar: bool = False  # Optional fail-closed calendar policy
+    regime_smt_pair_minutes: int = 120
+    regime_trap_min_bars: int = 5
+
     # Phase 4 Regime & Time Alignment Filters (Recognizing Market Conditions / Time & Structure)
     overnight_exhaustion_pts: float = 300.0
     overnight_exhaustion_pct: float = 0.015  # Scales 300pt rule proportionally to index level
@@ -134,6 +144,8 @@ class BotConfig:
     enable_lunch_block: bool = True
 
     def __post_init__(self):
+        if self.regime_smt_pair_minutes < 1 or self.regime_trap_min_bars < 3 or self.overnight_exhaustion_pts <= 0:
+            raise ValueError("Invalid regime threshold")
         if self.discretion_mode == DiscretionMode.STRICT and self.structure_mode != StructureMode.STRICT:
             raise ValueError("STRICT discretion requires STRICT structure, model and narrative modes")
         if not 0 < self.min_displacement_body_fraction <= 1:

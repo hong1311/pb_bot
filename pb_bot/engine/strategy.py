@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
 
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, StructureMode, DiscretionMode, PlaybookModel
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, StructureMode, DiscretionMode, PlaybookModel, RegimeMode
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.liquidity import LiquidityTracker
 from pb_bot.core.models import (
@@ -30,6 +30,7 @@ from pb_bot.engine.narrative import MarketNarrativeEngine
 from pb_bot.engine.playbook import ManipulationLeg, PlaybookEngine
 from pb_bot.engine.structure import StructureEngine
 from pb_bot.engine.discretion import DiscretionEngine
+from pb_bot.engine.regime import RegimeEngine
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,7 @@ class PBStrategyEngine:
         self.playbook = PlaybookEngine(config)
         self.structure = StructureEngine(config)
         self.discretion = DiscretionEngine(config)
+        self.regime = RegimeEngine(config, calendar)
         self._structural_decision = None
 
         # Daily runtime state
@@ -175,8 +177,16 @@ class PBStrategyEngine:
             if nq_b is not None or es_b is not None:
                 self.liquidity.update_bars(tf, nq_b, es_b)
 
-        # Update Daily Profile state
-        bias_state = self.bias_engine.evaluate_daily_profile(ts, nq_sess, self._all_fvgs_by_tf(), current_price=nq_bar.close)
+        # Regime observes every closed minute, including warmup and open positions.
+        self.playbook.update(nq_bar, nq_sess, self._all_fvgs_by_tf(), self.liquidity.nq_swings)
+        self.regime.update(nq_bar, nq_sess, nq_closed, created_fvgs, self.liquidity.smt_events,
+                           self.playbook.evidence_at(ts), self.narrative.current)
+        strict_regime = self.config.regime_mode == RegimeMode.STRICT
+        # Replace only the legacy Seek & Destroy classification in strict mode.
+        bias_state = self.bias_engine.evaluate_daily_profile(
+            ts, nq_sess, self._all_fvgs_by_tf(), current_price=nq_bar.close,
+            seek_override=self.regime.seek_active if strict_regime else None,
+        )
 
         # Advance narrative even during warmup, outside execution hours, or in a trade.
         self.narrative.update(
@@ -185,7 +195,6 @@ class PBStrategyEngine:
             blocked=bias_state.seek_and_destroy_active or bias_state.profile == DailyProfile.SEEK_AND_DESTROY,
         )
 
-        self.playbook.update(nq_bar, nq_sess, self._all_fvgs_by_tf(), self.liquidity.nq_swings)
         self.structure.update(nq_bar, nq_sess.trading_day, nq_closed, created_fvgs,
                               newly_confirmed_ifvgs, self.playbook.evidence_at(ts))
 
@@ -254,54 +263,61 @@ class PBStrategyEngine:
                 self._log_rejection(ts, "NY_LUNCH_ACCUMULATION", "12:00-13:00 NY lunch stand-aside")
             return None
 
-        # Forex Factory Red Folder calendar gates (Yellow ignored)
-        if self.calendar is not None:
-            pm_red = self.calendar.has_pm_red_news(nq_sess.trading_day)
-            if pm_red is not None and ts.time() < time(12, 0):
+        if strict_regime:
+            if self.regime.blocked:
                 if newly_confirmed_ifvgs:
-                    self._log_rejection(ts, "PM_RED_NEWS_SUPPRESSION", f"AM suppressed by PM {pm_red.title}")
+                    for reason in self.regime.reasons:
+                        self._log_rejection(ts, reason, "V2.5 market regime gate")
                 return None
-            pre_event = self.calendar.is_day_before_nfp_or_cpi(nq_sess.trading_day)
-            if pre_event is not None:
+        else:
+            # Forex Factory Red Folder calendar gates (Yellow ignored)
+            if self.calendar is not None:
+                pm_red = self.calendar.has_pm_red_news(nq_sess.trading_day)
+                if pm_red is not None and ts.time() < time(12, 0):
+                    if newly_confirmed_ifvgs:
+                        self._log_rejection(ts, "PM_RED_NEWS_SUPPRESSION", f"AM suppressed by PM {pm_red.title}")
+                    return None
+                pre_event = self.calendar.is_day_before_nfp_or_cpi(nq_sess.trading_day)
+                if pre_event is not None:
+                    if newly_confirmed_ifvgs:
+                        self._log_rejection(ts, "PRE_NFP_CPI_CHOP", f"Day before {pre_event.title}")
+                    return None
+                freeze_ev = self.calendar.active_red_news_freeze(ts)
+                if freeze_ev is not None:
+                    if newly_confirmed_ifvgs:
+                        self._log_rejection(ts, "RED_NEWS_FREEZE", f"Frozen around {freeze_ev.title}")
+                    return None
+
+            if bias_state.seek_and_destroy_active or bias_state.profile == DailyProfile.SEEK_AND_DESTROY:
                 if newly_confirmed_ifvgs:
-                    self._log_rejection(ts, "PRE_NFP_CPI_CHOP", f"Day before {pre_event.title}")
+                    self._log_rejection(ts, "SEEK_AND_DESTROY", bias_state.notes)
                 return None
-            freeze_ev = self.calendar.active_red_news_freeze(ts)
-            if freeze_ev is not None:
+
+            # Condition #1: Dual-sided SMT divergence at key levels
+            if self.config.enable_dual_smt_chop_filter and self.liquidity.has_dual_sided_smt(ts, current_price=nq_bar.close):
                 if newly_confirmed_ifvgs:
-                    self._log_rejection(ts, "RED_NEWS_FREEZE", f"Frozen around {freeze_ev.title}")
+                    self._log_rejection(ts, "DUAL_SMT_CHOP", "Concurrent Bullish & Bearish key-level SMT")
                 return None
 
-        if bias_state.seek_and_destroy_active or bias_state.profile == DailyProfile.SEEK_AND_DESTROY:
-            if newly_confirmed_ifvgs:
-                self._log_rejection(ts, "SEEK_AND_DESTROY", bias_state.notes)
-            return None
+            # Condition #2: Overnight exhaustion (>300 pts + HTF daily objective swept)
+            if self.bias_engine.is_overnight_exhausted(nq_sess, current_price=nq_bar.close) and ts.time() < time(11, 0):
+                if newly_confirmed_ifvgs:
+                    self._log_rejection(
+                        ts,
+                        "OVERNIGHT_EXHAUSTION_300PTS",
+                        f"Overnight range {nq_sess.overnight_range:.1f}pts + HTF objective hit",
+                    )
+                return None
 
-        # Condition #1: Dual-sided SMT divergence at key levels
-        if self.config.enable_dual_smt_chop_filter and self.liquidity.has_dual_sided_smt(ts, current_price=nq_bar.close):
-            if newly_confirmed_ifvgs:
-                self._log_rejection(ts, "DUAL_SMT_CHOP", "Concurrent Bullish & Bearish key-level SMT")
-            return None
-
-        # Condition #2: Overnight exhaustion (>300 pts + HTF daily objective swept)
-        if self.bias_engine.is_overnight_exhausted(nq_sess, current_price=nq_bar.close) and ts.time() < time(11, 0):
-            if newly_confirmed_ifvgs:
-                self._log_rejection(
-                    ts,
-                    "OVERNIGHT_EXHAUSTION_300PTS",
-                    f"Overnight range {nq_sess.overnight_range:.1f}pts + HTF objective hit",
-                )
-            return None
-
-        # Volatility check: zero 5m FVGs printed between 09:30 and 10:00 -> stand aside in 10:00 hour
-        if (
-            self.config.enable_am_5m_fvg_volatility_filter
-            and time(10, 0) <= ts.time() < time(11, 0)
-            and self.am_5m_fvg_count == 0
-        ):
-            if newly_confirmed_ifvgs:
-                self._log_rejection(ts, "NO_5M_FVG_VOLATILITY", "Zero 5m FVGs printed since 09:30 NY")
-            return None
+            # Volatility check: zero 5m FVGs printed between 09:30 and 10:00 -> stand aside in 10:00 hour
+            if (
+                self.config.enable_am_5m_fvg_volatility_filter
+                and time(10, 0) <= ts.time() < time(11, 0)
+                and self.am_5m_fvg_count == 0
+            ):
+                if newly_confirmed_ifvgs:
+                    self._log_rejection(ts, "NO_5M_FVG_VOLATILITY", "Zero 5m FVGs printed since 09:30 NY")
+                return None
 
         direction = bias_state.bias
         if direction == Direction.NEUTRAL:
@@ -320,6 +336,11 @@ class PBStrategyEngine:
             direction, newly_confirmed_ifvgs, ts, nq_bar
         )
         if chosen_ifvg is None:
+            return None
+
+        entry_regime_reason = self.regime.audit_entry(ts, chosen_ifvg, self._selected_leg)
+        if strict_regime and entry_regime_reason:
+            self._log_rejection(ts, entry_regime_reason, "Repeated overlapping reversal candles in IFVG")
             return None
 
         # Slow/Choppy LRLR Inversion Filter (DOL 2.0 [40:24])
@@ -495,6 +516,8 @@ class PBStrategyEngine:
                 "model_mode": self.config.model_mode.value,
                 "structure_mode": self.config.structure_mode.value,
                 "discretion_mode": self.config.discretion_mode.value,
+                "regime_mode": self.config.regime_mode.value,
+                "regime": self.regime.snapshot(),
                 "discretion": discretion.snapshot(),
                 "structural_leg": self._structural_decision.leg.snapshot() if self._structural_decision and self._structural_decision.leg else None,
                 "playbook_model": model_decision.model.value if model_decision else None,

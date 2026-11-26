@@ -8,7 +8,7 @@ from pb_bot.backtest.compare import format_comparison_table, run_comparison_matr
 from pb_bot.backtest.report import format_report
 from pb_bot.backtest.simulator import run_backtest
 from pb_bot.backtest.visualizer import generate_html_report
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, PlaybookModel, StructureMode, DiscretionMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, PlaybookModel, StructureMode, DiscretionMode, RegimeMode
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.data.feed import (
     generate_synthetic_multi_day_suite,
@@ -27,11 +27,14 @@ def main() -> None:
     parser.add_argument("--ablation", action="store_true", help="Run filter ablation study across Phase 4 gates")
     parser.add_argument("--am-end", default="11:00", help="NY AM window end HH:MM (e.g. 11:00 or 11:30)")
     parser.add_argument("--narrative-mode", choices=[m.value for m in NarrativeMode], default=NarrativeMode.OBSERVE.value)
+    parser.add_argument("--regime-mode", choices=[m.value for m in RegimeMode], default=RegimeMode.OBSERVE.value)
+    parser.add_argument("--require-calendar", action="store_true", help="Block strict-mode entries unless an economic calendar is supplied")
     parser.add_argument("--discretion-mode", choices=[m.value for m in DiscretionMode], default=DiscretionMode.OBSERVE.value)
     parser.add_argument("--validated-wick-stop", action="store_true", help="Experimental: validated midpoint stop, strict discretion market entries only")
     parser.add_argument("--structure-mode", choices=[m.value for m in StructureMode], default=StructureMode.OBSERVE.value)
     parser.add_argument("--model-mode", choices=[m.value for m in PlaybookMode], default=PlaybookMode.OBSERVE.value)
     parser.add_argument("--models", nargs="+", choices=[m.value for m in PlaybookModel], default=[m.value for m in PlaybookModel])
+    parser.add_argument("--regime-log", type=Path, help="Write regime decisions as JSONL")
     parser.add_argument("--discretion-log", type=Path, help="Write discretion decisions as JSONL")
     parser.add_argument("--structure-log", type=Path, help="Write structural decisions as JSONL")
     parser.add_argument("--model-log", type=Path, help="Write model candidate decisions as JSONL")
@@ -52,6 +55,8 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true", help="Print detailed rejection reasons")
     args = parser.parse_args()
 
+    if args.require_calendar and args.regime_mode != "STRICT":
+        parser.error("--require-calendar requires --regime-mode STRICT")
     if args.discretion_mode == "STRICT" and args.structure_mode != "STRICT":
         parser.error("--discretion-mode STRICT requires --structure-mode STRICT --model-mode STRICT --narrative-mode STRICT")
     if args.validated_wick_stop and args.discretion_mode != "STRICT":
@@ -76,13 +81,14 @@ def main() -> None:
         allow_pm_session=args.allow_pm,
         narrative_mode=NarrativeMode(args.narrative_mode),
         model_mode=PlaybookMode(args.model_mode), structure_mode=StructureMode(args.structure_mode), discretion_mode=DiscretionMode(args.discretion_mode),
+        regime_mode=RegimeMode(args.regime_mode), regime_require_calendar=args.require_calendar,
         enable_validated_wick_stop=args.validated_wick_stop,
         enabled_models=tuple(PlaybookModel(m) for m in args.models),
     )
 
     calendar = EconomicCalendar.from_csv(args.calendar) if args.calendar else None
     if calendar is None:
-        print("WARNING: no news calendar supplied; news filters are inactive.")
+        print("WARNING: calendar required; STRICT regime blocks entries." if args.require_calendar else "WARNING: no news calendar supplied; news filters are inactive.")
 
     if args.ablation:
         ab_rows = run_ablation_study(nq_bars, es_bars, cfg, calendar=calendar)
@@ -99,7 +105,11 @@ def main() -> None:
     print(f"Model mode: {cfg.model_mode.value} | enabled: {','.join(m.value for m in cfg.enabled_models)} | decisions: {len(result.model_events)}")
     print(f"Structure mode: {cfg.structure_mode.value} | decisions: {len(result.structure_events)}")
     print(f"Discretion mode: {cfg.discretion_mode.value} | decisions: {len(result.discretion_events)}")
+    print(f"Regime mode: {cfg.regime_mode.value} | events: {len(result.regime_events)}")
     print(format_report(result, verbose=args.verbose))
+    if args.regime_log:
+        args.regime_log.parent.mkdir(parents=True, exist_ok=True)
+        args.regime_log.write_text("".join(json.dumps(e) + "\n" for e in result.regime_events), encoding="utf-8")
     if args.discretion_log:
         args.discretion_log.parent.mkdir(parents=True, exist_ok=True)
         args.discretion_log.write_text("".join(json.dumps(e) + "\n" for e in result.discretion_events), encoding="utf-8")
