@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
 
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, StructureMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, StructureMode, DiscretionMode, PlaybookModel
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.liquidity import LiquidityTracker
 from pb_bot.core.models import (
@@ -29,6 +29,7 @@ from pb_bot.engine.risk_manager import OpenPosition, RiskManager
 from pb_bot.engine.narrative import MarketNarrativeEngine
 from pb_bot.engine.playbook import ManipulationLeg, PlaybookEngine
 from pb_bot.engine.structure import StructureEngine
+from pb_bot.engine.discretion import DiscretionEngine
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class PBStrategyEngine:
         self.narrative = MarketNarrativeEngine()
         self.playbook = PlaybookEngine(config)
         self.structure = StructureEngine(config)
+        self.discretion = DiscretionEngine(config)
         self._structural_decision = None
 
         # Daily runtime state
@@ -186,6 +188,8 @@ class PBStrategyEngine:
         self.playbook.update(nq_bar, nq_sess, self._all_fvgs_by_tf(), self.liquidity.nq_swings)
         self.structure.update(nq_bar, nq_sess.trading_day, nq_closed, created_fvgs,
                               newly_confirmed_ifvgs, self.playbook.evidence_at(ts))
+
+        self.discretion.update(nq_bar, nq_sess.trading_day, nq_closed)
 
         # Track 09:30 Judas manipulation away from 09:30 open
         if nq_sess.open_930 is not None and ts.time() >= time(9, 30):
@@ -340,7 +344,8 @@ class PBStrategyEngine:
                 return None
             evidence = model_decision.evidence
             key_level_ok, setup_type, key_detail, matched_fvg = True, model_decision.model.value, evidence.label, evidence.fvg
-            if matched_fvg is not None and self._is_disqualified_stacked_fvg(matched_fvg, direction, nq_sess):
+            if (self.config.discretion_mode != DiscretionMode.STRICT and matched_fvg is not None
+                    and self._is_disqualified_stacked_fvg(matched_fvg, direction, nq_sess)):
                 self._log_rejection(ts, "STACKED_FVG_PREMIUM_DISQUALIFIED", matched_fvg.id)
                 return None
         else:
@@ -390,23 +395,39 @@ class PBStrategyEngine:
             )
             return None
 
-        # 8. Premium/Discount Continuation Guard (CONDITIONS [23:08] vs Breaker Blocks [25:51])
-        past_eq_05 = self._is_past_equilibrium(direction, nq_bar.close, nq_sess)
-        is_continuation_extreme = self._is_overextended_continuation(direction, nq_bar.close, nq_sess)
-        if past_eq_05 and self._has_unfilled_1h_fvg_behind(direction, nq_bar.close):
-            self._log_rejection(
-                ts,
-                "TOO_PREMIUM_OR_DISCOUNT_WITH_1H_FVG_BEHIND",
-                f"Close={nq_bar.close:.2f} past 0.5 EQ with unfilled 1H FVG behind",
-            )
-            return None
-
-        # 9. Compute Entry, Stop Loss, DOL Target, & Risk Sizing
+        # 8. V2.4 evaluates the prior aligned impulse, not the opposing entry leg.
+        # OBSERVE preserves the legacy gates and sizing; STRICT replaces them.
         entry_price, order_type = self._resolve_entry_price(chosen_ifvg, direction)
-        manip_extreme, wick_eq = self._get_manipulation_stop_anchor(direction, chosen_ifvg)
+        strict_discretion = self.config.discretion_mode == DiscretionMode.STRICT
+        model = model_decision.model if model_decision else (PlaybookModel.CONTINUATION if setup_type == "CONTINUATION_5M" else None)
+        discretion = self.discretion.audit(
+            direction, model, matched_fvg, self._selected_leg, chosen_ifvg,
+            entry_price, order_type,
+            self.nq_fvgs[matched_fvg.timeframe].fvgs if matched_fvg is not None else (),
+            self._has_unfilled_1h_fvg_behind(direction, entry_price), ts,
+        )
+        if strict_discretion:
+            if not discretion.allowed:
+                self._log_rejection(ts, discretion.reason, "Structural discretion gate")
+                return None
+            is_continuation_extreme = discretion.reduced_risk
+        else:
+            past_eq_05 = self._is_past_equilibrium(direction, nq_bar.close, nq_sess)
+            is_continuation_extreme = self._is_overextended_continuation(direction, nq_bar.close, nq_sess)
+            if past_eq_05 and self._has_unfilled_1h_fvg_behind(direction, nq_bar.close):
+                self._log_rejection(
+                    ts, "TOO_PREMIUM_OR_DISCOUNT_WITH_1H_FVG_BEHIND",
+                    f"Close={nq_bar.close:.2f} past 0.5 EQ with unfilled 1H FVG behind",
+                )
+                return None
+
+        # 9. Compute stop from the actual manipulation extreme. A separately
+        # validated midpoint exception is optional and never used for limits.
+        manip_extreme, _ = self._get_manipulation_stop_anchor(direction, chosen_ifvg)
         if self._selected_leg_extreme is not None:
             manip_extreme = self._selected_leg_extreme
-        stop_loss = self.risk.calculate_stop_loss(direction, manip_extreme)  # Wick midpoint requires separately validated retest
+        stop_loss = self.risk.calculate_stop_loss(direction, manip_extreme,
+            oversized_wick_midpoint=discretion.wick_midpoint if strict_discretion else None)
 
         # Ensure SL is on valid side of entry
         if (direction == Direction.BULLISH and stop_loss >= entry_price) or (
@@ -473,6 +494,8 @@ class PBStrategyEngine:
                 "narrative": narrative.snapshot() if narrative else None,
                 "model_mode": self.config.model_mode.value,
                 "structure_mode": self.config.structure_mode.value,
+                "discretion_mode": self.config.discretion_mode.value,
+                "discretion": discretion.snapshot(),
                 "structural_leg": self._structural_decision.leg.snapshot() if self._structural_decision and self._structural_decision.leg else None,
                 "playbook_model": model_decision.model.value if model_decision else None,
                 "model_evidence": model_decision.evidence.snapshot() if model_decision else None,

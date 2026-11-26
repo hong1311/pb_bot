@@ -26,6 +26,11 @@ class StructureMode(str, Enum):
     STRICT = "STRICT"    # Require evidence-anchored structural selection
 
 
+class DiscretionMode(str, Enum):
+    OBSERVE = "OBSERVE"  # Audit structural ranges without changing execution
+    STRICT = "STRICT"    # Enforce structural range and displacement gates
+
+
 class PlaybookModel(str, Enum):
     MAC = "MAC"
     CONTINUATION = "CONTINUATION"
@@ -104,6 +109,10 @@ class BotConfig:
     narrative_mode: NarrativeMode = NarrativeMode.OBSERVE
     model_mode: PlaybookMode = PlaybookMode.OBSERVE
     structure_mode: StructureMode = StructureMode.OBSERVE
+    discretion_mode: DiscretionMode = DiscretionMode.OBSERVE
+    min_displacement_body_fraction: float = 0.60  # Research proxy, not instructor threshold
+    enable_validated_wick_stop: bool = False  # Experimental, market-close entries only
+    oversized_wick_ratio: float = 2.5  # Research proxy for unusually large wick
     enabled_models: Tuple[PlaybookModel, ...] = tuple(PlaybookModel)
     model_evidence_minutes: int = 45
     po3_accumulation_minutes: int = 15
@@ -125,6 +134,14 @@ class BotConfig:
     enable_lunch_block: bool = True
 
     def __post_init__(self):
+        if self.discretion_mode == DiscretionMode.STRICT and self.structure_mode != StructureMode.STRICT:
+            raise ValueError("STRICT discretion requires STRICT structure, model and narrative modes")
+        if not 0 < self.min_displacement_body_fraction <= 1:
+            raise ValueError("Displacement body fraction must be in (0, 1]")
+        if not 0.5 < self.continuation_extreme_threshold <= 1:
+            raise ValueError("Continuation extreme threshold must be in (0.5, 1]")
+        if not 0 < self.continuation_size_mult <= 1 or self.oversized_wick_ratio <= 0:
+            raise ValueError("Invalid discretion risk multiplier or wick ratio")
         if self.structure_mode == StructureMode.STRICT and self.model_mode != PlaybookMode.STRICT:
             raise ValueError("STRICT structure mode requires STRICT model and narrative modes")
         if self.model_mode == PlaybookMode.STRICT and self.narrative_mode != NarrativeMode.STRICT:

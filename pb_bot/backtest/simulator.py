@@ -21,6 +21,7 @@ class BacktestResult:
     narrative_events: List[dict] = field(default_factory=list)
     model_events: List[dict] = field(default_factory=list)
     structure_events: List[dict] = field(default_factory=list)
+    discretion_events: List[dict] = field(default_factory=list)
 
 
 class BacktestBroker(BrokerAdapter):
@@ -243,6 +244,7 @@ def run_backtest(
         narrative_events=engine.narrative.events,
         model_events=engine.playbook.events,
         structure_events=engine.structure.events,
+        discretion_events=engine.discretion.events,
     )
 
 
