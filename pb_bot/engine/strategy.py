@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
 
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.liquidity import LiquidityTracker
 from pb_bot.core.models import (
@@ -27,6 +27,7 @@ from pb_bot.data.resampler import MultiTimeframeResampler, SUPPORTED_TIMEFRAMES
 from pb_bot.engine.bias_profile import BiasAndProfileEngine, DailyProfile
 from pb_bot.engine.risk_manager import OpenPosition, RiskManager
 from pb_bot.engine.narrative import MarketNarrativeEngine
+from pb_bot.engine.playbook import ManipulationLeg, PlaybookEngine
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class PBStrategyEngine:
         self.bias_engine = BiasAndProfileEngine(config)
         self.risk = RiskManager(config)
         self.narrative = MarketNarrativeEngine()
+        self.playbook = PlaybookEngine(config)
 
         # Daily runtime state
         self._current_day = None
@@ -80,6 +82,7 @@ class PBStrategyEngine:
         self.rejections: List[RejectionRecord] = []
         self.submitted_orders: List[OrderRequest] = []
         self._selected_leg_extreme: Optional[float] = None
+        self._selected_leg: Optional[ManipulationLeg] = None
 
     def _log_rejection(self, ts: datetime, code: str, detail: str) -> None:
         self.rejections.append(RejectionRecord(ts, code, detail))
@@ -176,6 +179,8 @@ class PBStrategyEngine:
             self._all_fvgs_by_tf(), created_fvgs, newly_confirmed_ifvgs, nq_closed,
             blocked=bias_state.seek_and_destroy_active or bias_state.profile == DailyProfile.SEEK_AND_DESTROY,
         )
+
+        self.playbook.update(nq_bar, nq_sess, self._all_fvgs_by_tf(), self.liquidity.nq_swings)
 
         # Track 09:30 Judas manipulation away from 09:30 open
         if nq_sess.open_930 is not None and ts.time() >= time(9, 30):
@@ -301,10 +306,6 @@ class PBStrategyEngine:
 
         narrative = self.narrative.current
         strict_narrative = self.config.narrative_mode == NarrativeMode.STRICT
-        if strict_narrative and (narrative is None or not narrative.can_enter(direction, ts)):
-            self._log_rejection(ts, "NARRATIVE_NOT_READY", narrative.phase.value if narrative else "NO_DELIVERY_SOURCE")
-            return None
-
         # 4. Highest-Timeframe IFVG Selection (5m -> 4m -> 3m -> 2m -> 1m)
         chosen_ifvg, is_judas_override = self._select_highest_tf_ifvg(
             direction, newly_confirmed_ifvgs, ts, nq_bar
@@ -321,10 +322,26 @@ class PBStrategyEngine:
             )
             return None
 
-        # 5. Key-Level & Condition Gate (with ES Key-Level SMT, Stacked FVG 0.50, & Time Alignment Matrix)
-        key_level_ok, setup_type, key_detail, matched_fvg = self._check_key_level_gate(
-            direction, ts, nq_bar, nq_sess
-        )
+        # Model-specific evidence is collected before the IFVG; in observe mode it is diagnostic only.
+        model_decision = self.playbook.evaluate(direction, ts, nq_bar, self._selected_leg,
+                                                narrative, chosen_ifvg, bias_state.profile)
+        strict_models = self.config.model_mode == PlaybookMode.STRICT
+        if strict_narrative and (narrative is None or not narrative.can_enter(direction, ts)):
+            self._log_rejection(ts, "NARRATIVE_NOT_READY", narrative.phase.value if narrative else "NO_DELIVERY_SOURCE")
+            return None
+        if strict_models:
+            if model_decision is None or is_judas_override:
+                self._log_rejection(ts, "NO_ELIGIBLE_PB_MODEL", "No enabled model with fresh causal evidence")
+                return None
+            evidence = model_decision.evidence
+            key_level_ok, setup_type, key_detail, matched_fvg = True, model_decision.model.value, evidence.label, evidence.fvg
+            if matched_fvg is not None and self._is_disqualified_stacked_fvg(matched_fvg, direction, nq_sess):
+                self._log_rejection(ts, "STACKED_FVG_PREMIUM_DISQUALIFIED", matched_fvg.id)
+                return None
+        else:
+            key_level_ok, setup_type, key_detail, matched_fvg = self._check_key_level_gate(
+                direction, ts, nq_bar, nq_sess
+            )
         if not key_level_ok and not is_judas_override:
             code = "STACKED_FVG_PREMIUM_DISQUALIFIED" if key_detail.startswith("STACKED_FVG_") else "NO_VALID_KEY_LEVEL"
             self._log_rejection(ts, code, key_detail)
@@ -337,7 +354,7 @@ class PBStrategyEngine:
             and not is_judas_override
             and matched_fvg is not None
             and matched_fvg.timeframe in ("1H", "4H", "1D")
-            and not matched_fvg.internal_extreme_swept
+            and not (model_decision.evidence.pivot_price is not None if strict_models else matched_fvg.internal_extreme_swept)
             and not self._has_aligned_confirmation(matched_fvg, direction, ts)
         ):
             self._log_rejection(
@@ -449,9 +466,15 @@ class PBStrategyEngine:
                 "narrative_mode": self.config.narrative_mode.value,
                 "narrative_id": narrative.id if strict_narrative else None,
                 "narrative": narrative.snapshot() if narrative else None,
+                "model_mode": self.config.model_mode.value,
+                "playbook_model": model_decision.model.value if model_decision else None,
+                "model_evidence": model_decision.evidence.snapshot() if model_decision else None,
+                "model_key_level_id": matched_fvg.id if strict_models and matched_fvg else None,
             },
         )
         order_id = self.broker.submit_order(order)
+        if strict_models:
+            self.playbook.consume(model_decision.evidence)
         self.trades_today += 1
         self.submitted_orders.append(order)
 
@@ -499,6 +522,7 @@ class PBStrategyEngine:
         nq_bar: Bar,
     ) -> Tuple[Optional[IFVG], bool]:
         self._selected_leg_extreme = None
+        self._selected_leg = None
         # 09:30 AM Judas 1m override (Building Discretion [26:45])
         if (
             self.config.enable_0930_judas_1m_override
@@ -544,6 +568,8 @@ class PBStrategyEngine:
                        if i.direction == direction and i.source_fvg.id == outer.id]
             if aligned:
                 self._selected_leg_extreme = leg_low if direction == Direction.BULLISH else leg_high
+                self._selected_leg = ManipulationLeg(leg_start_ts, recent_1m[ext_idx].timestamp,
+                                                     self._selected_leg_extreme)
                 return aligned[-1], False
             return None, False
         return None, False

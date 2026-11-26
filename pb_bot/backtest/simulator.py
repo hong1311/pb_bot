@@ -19,6 +19,7 @@ class BacktestResult:
     rejections: List[RejectionRecord] = field(default_factory=list)
     equity_curve: List[Tuple[datetime, float]] = field(default_factory=list)
     narrative_events: List[dict] = field(default_factory=list)
+    model_events: List[dict] = field(default_factory=list)
 
 
 class BacktestBroker(BrokerAdapter):
@@ -239,6 +240,7 @@ def run_backtest(
         rejections=engine.rejections,
         equity_curve=broker.equity_curve,
         narrative_events=engine.narrative.events,
+        model_events=engine.playbook.events,
     )
 
 
@@ -265,6 +267,9 @@ def process_pair(engine: PBStrategyEngine, broker: BacktestBroker, nq_bar: Bar, 
         ):
             broker.pending_order = None
             engine._log_rejection(nq_bar.timestamp, "PENDING_NARRATIVE_INVALIDATED", req.reason)
+        elif not engine.playbook.accepts_pending(req.metadata.get("model_key_level_id")):
+            broker.pending_order = None
+            engine._log_rejection(nq_bar.timestamp, "PENDING_MODEL_INVALIDATED", req.reason)
 
 
 def settle_end_of_data(engine: PBStrategyEngine, broker: BacktestBroker, bar: Bar) -> None:

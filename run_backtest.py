@@ -8,7 +8,7 @@ from pb_bot.backtest.compare import format_comparison_table, run_comparison_matr
 from pb_bot.backtest.report import format_report
 from pb_bot.backtest.simulator import run_backtest
 from pb_bot.backtest.visualizer import generate_html_report
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, PlaybookModel
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.data.feed import (
     generate_synthetic_multi_day_suite,
@@ -27,6 +27,9 @@ def main() -> None:
     parser.add_argument("--ablation", action="store_true", help="Run filter ablation study across Phase 4 gates")
     parser.add_argument("--am-end", default="11:00", help="NY AM window end HH:MM (e.g. 11:00 or 11:30)")
     parser.add_argument("--narrative-mode", choices=[m.value for m in NarrativeMode], default=NarrativeMode.OBSERVE.value)
+    parser.add_argument("--model-mode", choices=[m.value for m in PlaybookMode], default=PlaybookMode.OBSERVE.value)
+    parser.add_argument("--models", nargs="+", choices=[m.value for m in PlaybookModel], default=[m.value for m in PlaybookModel])
+    parser.add_argument("--model-log", type=Path, help="Write model candidate decisions as JSONL")
     parser.add_argument("--narrative-log", type=Path, help="Write narrative transitions as JSONL")
     parser.add_argument("--calendar", type=Path, help="NY-time news CSV")
     parser.add_argument("--html", type=Path, help="Export visual HTML report to this path")
@@ -44,6 +47,8 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true", help="Print detailed rejection reasons")
     args = parser.parse_args()
 
+    if args.model_mode == "STRICT" and args.narrative_mode != "STRICT":
+        parser.error("--model-mode STRICT requires --narrative-mode STRICT")
     if args.nq_csv and args.es_csv:
         nq_bars = load_csv_bars(args.nq_csv, "NQ", "1m")
         es_bars = load_csv_bars(args.es_csv, "ES", "1m")
@@ -59,6 +64,8 @@ def main() -> None:
         be_mode=BreakEvenMode(args.be_mode),
         allow_pm_session=args.allow_pm,
         narrative_mode=NarrativeMode(args.narrative_mode),
+        model_mode=PlaybookMode(args.model_mode),
+        enabled_models=tuple(PlaybookModel(m) for m in args.models),
     )
 
     calendar = EconomicCalendar.from_csv(args.calendar) if args.calendar else None
@@ -77,7 +84,11 @@ def main() -> None:
 
     result = run_backtest(nq_bars, es_bars, cfg, calendar=calendar)
     print(f"Narrative mode: {cfg.narrative_mode.value} | transitions: {len(result.narrative_events)}")
+    print(f"Model mode: {cfg.model_mode.value} | enabled: {','.join(m.value for m in cfg.enabled_models)} | decisions: {len(result.model_events)}")
     print(format_report(result, verbose=args.verbose))
+    if args.model_log:
+        args.model_log.parent.mkdir(parents=True, exist_ok=True)
+        args.model_log.write_text("".join(json.dumps(e) + "\n" for e in result.model_events), encoding="utf-8")
     if args.narrative_log:
         args.narrative_log.parent.mkdir(parents=True, exist_ok=True)
         args.narrative_log.write_text("".join(json.dumps(e) + "\n" for e in result.narrative_events), encoding="utf-8")
