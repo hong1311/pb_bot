@@ -212,6 +212,22 @@ class LiquidityTracker:
 
         return True
 
+    def _find_correlated_es_swing(
+        self, timeframe: str, direction: Direction, nq_ts: datetime, max_delta_sec: int = 900
+    ) -> Optional[float]:
+        es_tracker = self.es_swings.get(timeframe)
+        if not es_tracker:
+            return None
+        swings = es_tracker.highs if direction == Direction.BULLISH else es_tracker.lows
+        best_price: Optional[float] = None
+        best_delta = float("inf")
+        for s in reversed(swings[-20:]):
+            delta = abs((s.timestamp - nq_ts).total_seconds())
+            if delta <= max_delta_sec and delta < best_delta:
+                best_delta = delta
+                best_price = s.price
+        return best_price
+
     def detect_equal_levels(
         self, timeframe: str, current_price: float
     ) -> Tuple[List[LiquidityPool], List[LiquidityPool]]:
@@ -232,6 +248,12 @@ class LiquidityTracker:
                     level = max(s1.price, s2.price)
                     if level > current_price:
                         span = abs(s2.index - s1.index)
+                        es_cands = [
+                            p for p in (
+                                self._find_correlated_es_swing(timeframe, Direction.BULLISH, s1.timestamp),
+                                self._find_correlated_es_swing(timeframe, Direction.BULLISH, s2.timestamp),
+                            ) if p is not None
+                        ]
                         pool = LiquidityPool(
                             kind="EQH",
                             price=level,
@@ -240,6 +262,7 @@ class LiquidityTracker:
                             priority=DOL_PRIORITY["EQH"],
                             label=f"{timeframe}_EQH",
                             bar_span=span,
+                            correlated_price=max(es_cands) if es_cands else None,
                         )
                         if span >= self.spread_apart_min_bars:
                             spread_apart.append(pool)
@@ -255,6 +278,12 @@ class LiquidityTracker:
                     level = min(s1.price, s2.price)
                     if level < current_price:
                         span = abs(s2.index - s1.index)
+                        es_cands = [
+                            p for p in (
+                                self._find_correlated_es_swing(timeframe, Direction.BEARISH, s1.timestamp),
+                                self._find_correlated_es_swing(timeframe, Direction.BEARISH, s2.timestamp),
+                            ) if p is not None
+                        ]
                         pool = LiquidityPool(
                             kind="EQL",
                             price=level,
@@ -263,6 +292,7 @@ class LiquidityTracker:
                             priority=DOL_PRIORITY["EQL"],
                             label=f"{timeframe}_EQL",
                             bar_span=span,
+                            correlated_price=min(es_cands) if es_cands else None,
                         )
                         if span >= self.spread_apart_min_bars:
                             spread_apart.append(pool)
@@ -296,6 +326,7 @@ class LiquidityTracker:
                             timeframe=timeframe,
                             priority=DOL_PRIORITY["LRL"],
                             label=f"{timeframe}_LRL_LOWS",
+                            correlated_price=self._find_correlated_es_swing(timeframe, Direction.BEARISH, l1.timestamp),
                         )
                     )
 
@@ -311,6 +342,7 @@ class LiquidityTracker:
                             timeframe=timeframe,
                             priority=DOL_PRIORITY["LRL"],
                             label=f"{timeframe}_LRL_HIGHS",
+                            correlated_price=self._find_correlated_es_swing(timeframe, Direction.BULLISH, h1.timestamp),
                         )
                     )
         return pools
@@ -422,10 +454,10 @@ class LiquidityTracker:
             if tracker:
                 if direction == Direction.BULLISH:
                     for sh in tracker.highs[-6:]:
-                        add_if_ahead("BSL", sh.price, tf, f"{tf}_BSL")
+                        add_if_ahead("BSL", sh.price, tf, f"{tf}_BSL", self._find_correlated_es_swing(tf, Direction.BULLISH, sh.timestamp))
                 else:
                     for sl in tracker.lows[-6:]:
-                        add_if_ahead("SSL", sl.price, tf, f"{tf}_SSL")
+                        add_if_ahead("SSL", sl.price, tf, f"{tf}_SSL", self._find_correlated_es_swing(tf, Direction.BEARISH, sl.timestamp))
 
         # Sort closest-first among valid targets, breaking ties by DOL priority
         candidates.sort(key=lambda p: (abs(p.price - current_price), p.priority))

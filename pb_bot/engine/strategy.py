@@ -81,6 +81,18 @@ class PBStrategyEngine:
     def _log_rejection(self, ts: datetime, code: str, detail: str) -> None:
         self.rejections.append(RejectionRecord(ts, code, detail))
 
+    @staticmethod
+    def _valid_es_target(
+        direction: Direction, es_target: Optional[float], es_bar: Bar
+    ) -> Optional[float]:
+        if es_target is None:
+            return None
+        if direction == Direction.BULLISH and es_target > es_bar.high:
+            return es_target
+        if direction == Direction.BEARISH and es_target < es_bar.low:
+            return es_target
+        return None
+
     def on_trade_closed(self, closed) -> None:
         pnl = getattr(closed, 'pnl_dollars', 0.0)
         if pnl < 0:
@@ -402,7 +414,7 @@ class PBStrategyEngine:
             metadata={
                 "profile": bias_state.profile.value,
                 "be_trigger_price": be_trigger,
-                "es_target_price": target_pool.correlated_price,
+                "es_target_price": self._valid_es_target(direction, target_pool.correlated_price, es_bar),
                 "ifvg_tf": chosen_ifvg.source_fvg.timeframe,
                 "key_level": key_detail,
             },
@@ -423,7 +435,7 @@ class PBStrategyEngine:
                 take_profit=order.take_profit,
                 opened_at=ts,
                 be_trigger_price=be_trigger,
-                es_target_price=target_pool.correlated_price,
+                es_target_price=self._valid_es_target(direction, target_pool.correlated_price, es_bar),
                 reason=order.reason,
                 metadata=order.metadata,
             )
