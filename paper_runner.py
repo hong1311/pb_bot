@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from pb_bot.backtest.simulator import BacktestBroker, process_pair, settle_end_of_data
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, PlaybookModel
 from pb_bot.core.models import Bar, Direction, OrderRequest
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.sessions import NY_TZ, to_ny
@@ -74,6 +74,9 @@ class PaperAlertBroker(BacktestBroker):
                 "reason": order.reason,
                 "narrative_mode": order.metadata.get("narrative_mode"),
                 "narrative": order.metadata.get("narrative"),
+                "model_mode": order.metadata.get("model_mode"),
+                "playbook_model": order.metadata.get("playbook_model"),
+                "model_evidence": order.metadata.get("model_evidence"),
             },
         )
         return oid
@@ -134,10 +137,9 @@ class PaperAlertBroker(BacktestBroker):
             ])
 
 
-def _append_narrative_events(engine, log_dir, cursor):
-    events = engine.narrative.events
+def _append_events(events, log_dir, cursor, filename):
     if cursor < len(events):
-        with (Path(log_dir) / "narrative_events.jsonl").open("a", encoding="utf-8") as f:
+        with (Path(log_dir) / filename).open("a", encoding="utf-8") as f:
             for event in events[cursor:]:
                 f.write(json.dumps(event) + "\n")
     return len(events)
@@ -157,9 +159,11 @@ def run_paper_replay(
 
     last_bar = None
     event_cursor = 0
+    model_cursor = 0
     for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
         process_pair(engine, broker, nq_bar, es_bar)
-        event_cursor = _append_narrative_events(engine, log_dir, event_cursor)
+        event_cursor = _append_events(engine.narrative.events, log_dir, event_cursor, "narrative_events.jsonl")
+        model_cursor = _append_events(engine.playbook.events, log_dir, model_cursor, "model_events.jsonl")
         last_bar = nq_bar
         if pace_ms > 0:
             pytime.sleep(pace_ms / 1000.0)
@@ -225,6 +229,7 @@ def poll_live_yfinance(
     engine = PBStrategyEngine(cfg, broker, calendar=calendar)
     seen_ts = None
     event_cursor = 0
+    model_cursor = 0
     started_mono = pytime.monotonic()
 
     print(
@@ -263,7 +268,8 @@ def poll_live_yfinance(
         new_count = 0
         for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
             process_pair(engine, broker, nq_bar, es_bar, warmup=is_warmup)
-            event_cursor = _append_narrative_events(engine, log_dir, event_cursor)
+            event_cursor = _append_events(engine.narrative.events, log_dir, event_cursor, "narrative_events.jsonl")
+            model_cursor = _append_events(engine.playbook.events, log_dir, model_cursor, "model_events.jsonl")
             seen_ts = nq_bar.timestamp
             new_count += 1
 
@@ -296,10 +302,15 @@ def main() -> None:
     parser.add_argument("--webhook", type=str, default=None, help="Optional Discord/Slack webhook URL")
     parser.add_argument("--allow-pm", action="store_true")
     parser.add_argument("--narrative-mode", choices=[m.value for m in NarrativeMode], default=NarrativeMode.OBSERVE.value)
+    parser.add_argument("--model-mode", choices=[m.value for m in PlaybookMode], default=PlaybookMode.OBSERVE.value)
+    parser.add_argument("--models", nargs="+", choices=[m.value for m in PlaybookModel], default=[m.value for m in PlaybookModel])
     parser.add_argument("--calendar", type=Path, help="NY-time news CSV")
     args = parser.parse_args()
 
-    cfg = BotConfig(allow_pm_session=args.allow_pm, narrative_mode=NarrativeMode(args.narrative_mode))
+    if args.model_mode == "STRICT" and args.narrative_mode != "STRICT":
+        parser.error("--model-mode STRICT requires --narrative-mode STRICT")
+    cfg = BotConfig(allow_pm_session=args.allow_pm, narrative_mode=NarrativeMode(args.narrative_mode),
+                    model_mode=PlaybookMode(args.model_mode), enabled_models=tuple(PlaybookModel(m) for m in args.models))
     calendar = EconomicCalendar.from_csv(args.calendar) if args.calendar else None
     if calendar is None:
         print("WARNING: no news calendar supplied; news filters are inactive.", flush=True)

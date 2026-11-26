@@ -16,6 +16,17 @@ class NarrativeMode(str, Enum):
     STRICT = "STRICT"    # Require a pre-established narrative and its locked DOL
 
 
+class PlaybookMode(str, Enum):
+    OBSERVE = "OBSERVE"  # Audit new model gates without changing orders
+    STRICT = "STRICT"    # Require an eligible model AND strict narrative
+
+
+class PlaybookModel(str, Enum):
+    MAC = "MAC"
+    CONTINUATION = "CONTINUATION"
+    PO3 = "PO3"
+
+
 class BreakEvenMode(str, Enum):
     OFF = "OFF"
     STRICT_INTERNAL = "STRICT_INTERNAL"  # Any internal high/low wick (Breaker Blocks rule)
@@ -86,6 +97,11 @@ class BotConfig:
 
     # Execution & Management Toggles
     narrative_mode: NarrativeMode = NarrativeMode.OBSERVE
+    model_mode: PlaybookMode = PlaybookMode.OBSERVE
+    enabled_models: Tuple[PlaybookModel, ...] = tuple(PlaybookModel)
+    model_evidence_minutes: int = 45
+    po3_accumulation_minutes: int = 15
+    po3_max_range_efficiency: float = 0.35
     entry_mode: EntryOrderMode = EntryOrderMode.MARKET_ON_CLOSE
     be_mode: BreakEvenMode = BreakEvenMode.SWING_5M
     enable_target_smt_exit: bool = True
@@ -101,3 +117,13 @@ class BotConfig:
     enable_time_alignment_matrix: bool = True
     enable_stacked_fvg_eq_filter: bool = True
     enable_lunch_block: bool = True
+
+    def __post_init__(self):
+        if self.model_mode == PlaybookMode.STRICT and self.narrative_mode != NarrativeMode.STRICT:
+            raise ValueError("STRICT model mode requires STRICT narrative mode")
+        if not self.enabled_models or any(m not in tuple(PlaybookModel) for m in self.enabled_models):
+            raise ValueError("Enable at least one valid playbook model")
+        if self.model_evidence_minutes < 1 or self.po3_accumulation_minutes < 3:
+            raise ValueError("Invalid model evidence or accumulation window")
+        if not 0 < self.po3_max_range_efficiency <= 1:
+            raise ValueError("PO3 range efficiency must be in (0, 1]")
