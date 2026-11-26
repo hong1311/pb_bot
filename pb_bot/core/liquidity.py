@@ -102,6 +102,7 @@ class LiquidityTracker:
         self.nq_swings: Dict[str, SwingTracker] = {}
         self.es_swings: Dict[str, SwingTracker] = {}
         self.smt_events: List[SMTEvent] = []
+        self._last_smt_pair: Dict[Tuple[str, Direction], tuple] = {}
 
     def _get_tracker(self, store: Dict[str, SwingTracker], symbol: str, tf: str) -> SwingTracker:
         if tf not in store:
@@ -138,9 +139,10 @@ class LiquidityTracker:
                     nq_curr.price < nq_prev.price and es_curr.price >= es_prev.price
                 ):
                     evt = SMTEvent(ts, timeframe, Direction.BULLISH, nq_curr.price, es_curr.price, "SWING_SMT")
-                    if not self.smt_events or (
-                        self.smt_events[-1].timestamp != ts or self.smt_events[-1].direction != Direction.BULLISH
-                    ):
+                    key = (timeframe, Direction.BULLISH)
+                    pair = (nq_prev.timestamp, nq_curr.timestamp, es_prev.timestamp, es_curr.timestamp)
+                    if self._last_smt_pair.get(key) != pair:
+                        self._last_smt_pair[key] = pair
                         self.smt_events.append(evt)
                         return evt
 
@@ -153,9 +155,10 @@ class LiquidityTracker:
                     nq_curr.price > nq_prev.price and es_curr.price <= es_prev.price
                 ):
                     evt = SMTEvent(ts, timeframe, Direction.BEARISH, nq_curr.price, es_curr.price, "SWING_SMT")
-                    if not self.smt_events or (
-                        self.smt_events[-1].timestamp != ts or self.smt_events[-1].direction != Direction.BEARISH
-                    ):
+                    key = (timeframe, Direction.BEARISH)
+                    pair = (nq_prev.timestamp, nq_curr.timestamp, es_prev.timestamp, es_curr.timestamp)
+                    if self._last_smt_pair.get(key) != pair:
+                        self._last_smt_pair[key] = pair
                         self.smt_events.append(evt)
                         return evt
 
@@ -400,18 +403,18 @@ class LiquidityTracker:
 
         # 1. Session & HTF external liquidity (paired with equivalent ES target when available)
         if direction == Direction.BULLISH:
-            add_if_ahead("PDH", nq_session.pdh, "1D", "PDH", es_session.pdh if es_session else None)
-            add_if_ahead("PWH", nq_session.pwh, "1W", "PWH", es_session.pwh if es_session else None)
+            add_if_ahead("PDH", None if nq_session.pdh is not None and nq_session.full_day.high is not None and nq_session.full_day.high >= nq_session.pdh else nq_session.pdh, "1D", "PDH", es_session.pdh if es_session else None)
+            add_if_ahead("PWH", None if nq_session.pwh is not None and nq_session.full_day.high is not None and nq_session.full_day.high >= nq_session.pwh else nq_session.pwh, "1W", "PWH", es_session.pwh if es_session else None)
             add_if_ahead(
                 "LONDON_H",
-                nq_session.london.high,
+                None if nq_session.london.high_swept else nq_session.london.high,
                 "SESSION",
                 "LONDON_HIGH",
                 es_session.london.high if es_session else None,
             )
             add_if_ahead(
                 "ASIA_H",
-                nq_session.asia.high,
+                None if nq_session.asia.high_swept else nq_session.asia.high,
                 "SESSION",
                 "ASIA_HIGH",
                 es_session.asia.high if es_session else None,
@@ -424,18 +427,18 @@ class LiquidityTracker:
                 es_session.data_830_high if es_session else None,
             )
         else:
-            add_if_ahead("PDL", nq_session.pdl, "1D", "PDL", es_session.pdl if es_session else None)
-            add_if_ahead("PWL", nq_session.pwl, "1W", "PWL", es_session.pwl if es_session else None)
+            add_if_ahead("PDL", None if nq_session.pdl is not None and nq_session.full_day.low is not None and nq_session.full_day.low <= nq_session.pdl else nq_session.pdl, "1D", "PDL", es_session.pdl if es_session else None)
+            add_if_ahead("PWL", None if nq_session.pwl is not None and nq_session.full_day.low is not None and nq_session.full_day.low <= nq_session.pwl else nq_session.pwl, "1W", "PWL", es_session.pwl if es_session else None)
             add_if_ahead(
                 "LONDON_L",
-                nq_session.london.low,
+                None if nq_session.london.low_swept else nq_session.london.low,
                 "SESSION",
                 "LONDON_LOW",
                 es_session.london.low if es_session else None,
             )
             add_if_ahead(
                 "ASIA_L",
-                nq_session.asia.low,
+                None if nq_session.asia.low_swept else nq_session.asia.low,
                 "SESSION",
                 "ASIA_LOW",
                 es_session.asia.low if es_session else None,

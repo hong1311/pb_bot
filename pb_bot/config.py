@@ -47,6 +47,7 @@ class BotConfig:
     max_wins_per_day: Optional[int] = None  # Optional cap (e.g., 1) to stop after hitting daily target
     max_stop_pts: Optional[float] = None      # Reject overextended setups with SL wider than N points
     enable_10am_macro_pause: bool = False     # Pause entries 09:55-10:10 NY around 10:00 USD releases
+    pending_order_max_minutes: int = 15  # Explicit configurable limit-order lifetime
     min_rr: float = 1.0                     # Hard floor: reject < 1:1 RR
     max_target_rr: float = 2.5              # Avoid chasing distant >2.5R intraday targets
     strict_max_rr: bool = False             # When True, reject targets exceeding max_target_rr

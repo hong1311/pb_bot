@@ -77,6 +77,7 @@ class PBStrategyEngine:
         self.active_position: Optional[OpenPosition] = None
         self.rejections: List[RejectionRecord] = []
         self.submitted_orders: List[OrderRequest] = []
+        self._selected_leg_extreme: Optional[float] = None
 
     def _log_rejection(self, ts: datetime, code: str, detail: str) -> None:
         self.rejections.append(RejectionRecord(ts, code, detail))
@@ -100,7 +101,7 @@ class PBStrategyEngine:
         elif pnl > 0:
             self.wins_today += 1
 
-    def on_1m_pair(self, nq_bar: Bar, es_bar: Bar) -> Optional[OrderRequest]:
+    def on_1m_pair(self, nq_bar: Bar, es_bar: Bar, allow_entry: bool = True) -> Optional[OrderRequest]:
         ts = to_ny(nq_bar.timestamp)
         nq_sess = self.nq_sessions.update(nq_bar)
         es_sess = self.es_sessions.update(es_bar)
@@ -175,7 +176,7 @@ class PBStrategyEngine:
         if self.active_position is not None:
             smt_exit = self.risk.check_target_smt_exit(self.active_position, es_bar)
             if smt_exit is not None:
-                self.broker.close_position_market(self.config.primary_symbol, smt_exit)
+                self.broker.close_position_market(self.active_position.symbol, smt_exit)
                 self.active_position = None
                 return None
 
@@ -186,8 +187,11 @@ class PBStrategyEngine:
             )
             if stop_update is not None:
                 new_sl, sl_reason = stop_update
-                self.active_position.stop_loss = new_sl
                 self.broker.modify_stop_loss(self.active_position.order_id, new_sl, sl_reason)
+                self.active_position.stop_loss = new_sl
+            return None
+
+        if not allow_entry:
             return None
 
         # 3. Hard Session, Trade Cap, & Regime Filters
@@ -315,13 +319,13 @@ class PBStrategyEngine:
             and not is_judas_override
             and matched_fvg is not None
             and matched_fvg.timeframe in ("1H", "4H", "1D")
-            and chosen_ifvg.source_fvg.timeframe == "1m"
             and not matched_fvg.internal_extreme_swept
+            and not self._has_aligned_confirmation(matched_fvg, direction, ts)
         ):
             self._log_rejection(
                 ts,
                 "TIME_ALIGNMENT_VIOLATION",
-                f"Direct {matched_fvg.timeframe}->1m entry blocked without 5m/15m flip or re-sweep",
+                f"Direct {matched_fvg.timeframe}->{chosen_ifvg.source_fvg.timeframe} entry blocked without aligned flip or re-sweep",
             )
             return None
 
@@ -360,7 +364,9 @@ class PBStrategyEngine:
         # 9. Compute Entry, Stop Loss, DOL Target, & Risk Sizing
         entry_price, order_type = self._resolve_entry_price(chosen_ifvg, direction)
         manip_extreme, wick_eq = self._get_manipulation_stop_anchor(direction, chosen_ifvg)
-        stop_loss = self.risk.calculate_stop_loss(direction, manip_extreme, wick_eq)
+        if self._selected_leg_extreme is not None:
+            manip_extreme = self._selected_leg_extreme
+        stop_loss = self.risk.calculate_stop_loss(direction, manip_extreme)  # Wick midpoint requires separately validated retest
 
         # Ensure SL is on valid side of entry
         if (direction == Direction.BULLISH and stop_loss >= entry_price) or (
@@ -403,7 +409,7 @@ class PBStrategyEngine:
 
         be_trigger = self._resolve_be_trigger(direction, entry_price)
         order = OrderRequest(
-            symbol=self.config.primary_symbol,
+            symbol=self.config.instrument.symbol,
             direction=direction,
             quantity=qty,
             order_type=order_type,
@@ -443,6 +449,14 @@ class PBStrategyEngine:
 
         return order
 
+    def _has_aligned_confirmation(self, fvg: FVG, direction: Direction, now: datetime) -> bool:
+        tf = self.config.htf_to_ltf_alignment.get(fvg.timeframe)
+        detector = self.nq_fvgs.get(tf)
+        if detector is None or fvg.first_tap_at is None:
+            return False
+        return any(i.direction == direction and fvg.first_tap_at <= i.confirmed_at <= now
+                   for i in detector.ifvgs[-20:])
+
     def _all_fvgs_by_tf(self) -> Dict[str, List[FVG]]:
         return {tf: det.fvgs for tf, det in self.nq_fvgs.items()}
 
@@ -459,6 +473,7 @@ class PBStrategyEngine:
         ts: datetime,
         nq_bar: Bar,
     ) -> Tuple[Optional[IFVG], bool]:
+        self._selected_leg_extreme = None
         # 09:30 AM Judas 1m override (Building Discretion [26:45])
         if (
             self.config.enable_0930_judas_1m_override
@@ -471,7 +486,9 @@ class PBStrategyEngine:
                 return aligned_1m[-1], True
 
         # Isolate the active manipulation leg (from local origin swing to sweep extreme)
-        recent_1m = self.nq_resampler.history["1m"][-20:]
+        recent_1m = self.nq_resampler.history["1m"][-45:]
+        if not recent_1m:
+            return None, False
         if direction == Direction.BULLISH:
             ext_idx = min(range(len(recent_1m)), key=lambda i: recent_1m[i].low)
             leg_prefix = recent_1m[: ext_idx + 1] or recent_1m
@@ -483,30 +500,27 @@ class PBStrategyEngine:
             origin_bar = min(leg_prefix, key=lambda b: b.low)
             leg_start_ts, leg_low, leg_high = origin_bar.timestamp, origin_bar.low, recent_1m[ext_idx].high
 
-        # Strict descending scan: 5m -> 4m -> 3m -> 2m -> 1m ONLY inside the active manipulation leg
+        # Select the outermost opposing gap on the highest timeframe inside this leg.
+        # The 45-minute leg window remains a heuristic pending annotated swing fixtures.
         for tf in self.config.ifvg_scan_ladder:
-            leg_uninverted = [
-                f for f in self.nq_fvgs[tf].fvgs[-4:]
-                if f.direction == direction.opposite
-                and f.state in (FVGState.UNFILLED_TARGET, FVGState.ACTIVE_CONDITION)
-                and f.created_at >= leg_start_ts
-                and f.bottom >= leg_low
-                and f.top <= leg_high
-            ]
-            if leg_uninverted and tf not in newly_confirmed_ifvgs:
-                self._log_rejection(
-                    ts,
-                    "WAITING_HIGHER_TF_IFVG",
-                    f"Higher TF {tf} still has un-inverted opposing FVG in manipulation leg [{leg_low:.2f}-{leg_high:.2f}]",
-                )
+            candidates = [f for f in self.nq_fvgs[tf].fvgs
+                          if f.direction == direction.opposite
+                          and leg_start_ts <= f.created_at <= recent_1m[ext_idx].timestamp
+                          and f.bottom >= leg_low and f.top <= leg_high]
+            if not candidates:
+                continue
+            outer = FVGDetector.select_outermost_opposing_fvg(candidates, direction)
+            if any(f.state != FVGState.INVERTED for f in candidates):
+                self._log_rejection(ts, "WAITING_HIGHER_TF_IFVG", f"{tf} opposing gap remains in manipulation leg")
                 return None, False
-
-            tf_mins = int(tf[:-1]) if tf.endswith("m") else 999
-            if tf in newly_confirmed_ifvgs and tf_mins >= self.config.min_ifvg_tf_minutes:
-                aligned = [i for i in newly_confirmed_ifvgs[tf] if i.direction == direction]
-                if aligned:
-                    return aligned[-1], False
-
+            if int(tf[:-1]) < self.config.min_ifvg_tf_minutes:
+                return None, False
+            aligned = [i for i in newly_confirmed_ifvgs.get(tf, [])
+                       if i.direction == direction and i.source_fvg.id == outer.id]
+            if aligned:
+                self._selected_leg_extreme = leg_low if direction == Direction.BULLISH else leg_high
+                return aligned[-1], False
+            return None, False
         return None, False
 
     def _is_disqualified_stacked_fvg(

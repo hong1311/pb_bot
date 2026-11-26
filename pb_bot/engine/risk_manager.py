@@ -123,7 +123,7 @@ class RiskManager:
         if base_qty < 1:
             return 0
         if is_continuation_extreme:
-            return max(1, math.floor((base_risk_dollars * self.config.continuation_size_mult) / dollar_risk_per_contract))
+            return max(0, math.floor((base_risk_dollars * self.config.continuation_size_mult) / dollar_risk_per_contract))
         return base_qty
 
     def check_target_smt_exit(

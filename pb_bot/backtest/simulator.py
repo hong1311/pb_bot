@@ -1,10 +1,11 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
 from pb_bot.config import BotConfig
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.models import Bar, BrokerAdapter, Direction, OrderRequest
+from pb_bot.core.sessions import SessionTracker, cme_trading_date, to_ny
 from pb_bot.data.feed import sync_dual_feed
 from pb_bot.engine.risk_manager import ClosedTrade, OpenPosition
 from pb_bot.engine.strategy import PBStrategyEngine, RejectionRecord
@@ -40,6 +41,8 @@ class BacktestBroker(BrokerAdapter):
         self._just_opened_on_bar_ts: Optional[datetime] = None
 
     def submit_order(self, order: OrderRequest) -> str:
+        if self.position is not None or self.pending_order is not None:
+            raise RuntimeError("Cannot submit while another order or position is active")
         self._order_seq += 1
         order_id = f"SIM_{self._order_seq:04d}"
 
@@ -81,7 +84,30 @@ class BacktestBroker(BrokerAdapter):
             # Close recorded on latest mark via force_close_at_bar
             self.position.metadata["pending_market_close_reason"] = reason
 
+    def expire_pending(self, nq_bar: Bar, es_bar: Optional[Bar] = None) -> None:
+        if self.pending_order is None:
+            return
+        _, req = self.pending_order
+        ts = to_ny(nq_bar.timestamp)
+        cfg = self.config
+        target_hit = nq_bar.open >= req.take_profit if req.direction == Direction.BULLISH else nq_bar.open <= req.take_profit
+        es_target = req.metadata.get("es_target_price")
+        if es_bar is not None and es_target is not None:
+            target_hit |= es_bar.open >= es_target if req.direction == Direction.BULLISH else es_bar.open <= es_target
+        if (cme_trading_date(ts) != cme_trading_date(req.timestamp)
+            or not SessionTracker.in_trading_window(ts, cfg.am_start, cfg.am_end, cfg.allow_pm_session, cfg.pm_start, cfg.pm_end)
+            or ts - req.timestamp >= timedelta(minutes=cfg.pending_order_max_minutes)
+            or target_hit):
+            self.pending_order = None
+
+    def process_market_close(self, bar: Bar) -> Optional[ClosedTrade]:
+        if self.position is None or "pending_market_close_reason" not in self.position.metadata:
+            return None
+        return self.process_bar(bar)
+
     def process_bar(self, nq_bar: Bar) -> Optional[ClosedTrade]:
+        self.expire_pending(nq_bar)
+        limit_filled = False
         # 1. Check pending limit order fill
         if self.position is None and self.pending_order is not None:
             order_id, req = self.pending_order
@@ -91,14 +117,16 @@ class BacktestBroker(BrokerAdapter):
                 (req.direction == Direction.BULLISH and nq_bar.high >= req.entry_price + 2.0 * risk_pts)
                 or (req.direction == Direction.BEARISH and nq_bar.low <= req.entry_price - 2.0 * risk_pts)
             )
-            if ran_away:
+            filled = (
+                (req.direction == Direction.BULLISH and nq_bar.low <= req.entry_price)
+                or (req.direction == Direction.BEARISH and nq_bar.high >= req.entry_price)
+            )
+            # With OHLC-only data, a possible fill takes precedence over a possible run-away.
+            target_touched = nq_bar.high >= req.take_profit if req.direction == Direction.BULLISH else nq_bar.low <= req.take_profit
+            if (ran_away or target_touched) and not filled:
                 self.pending_order = None
-            else:
-                filled = (
-                    (req.direction == Direction.BULLISH and nq_bar.low <= req.entry_price)
-                    or (req.direction == Direction.BEARISH and nq_bar.high >= req.entry_price)
-                )
-                if filled:
+            elif filled:
+                if nq_bar.timestamp > req.timestamp:
                     self.position = OpenPosition(
                         order_id=order_id,
                         symbol=req.symbol,
@@ -115,10 +143,11 @@ class BacktestBroker(BrokerAdapter):
                         metadata=req.metadata,
                     )
                     self.pending_order = None
-                    self._just_opened_on_bar_ts = nq_bar.timestamp
+                    self._just_opened_on_bar_ts = None
+                    limit_filled = True
 
         # 2. Evaluate open position (never stop out on the exact bar it opened at bar close)
-        if self.position is None or self._just_opened_on_bar_ts == nq_bar.timestamp:
+        if self.position is None or (self._just_opened_on_bar_ts == nq_bar.timestamp and "pending_market_close_reason" not in self.position.metadata):
             return None
 
         pos = self.position
@@ -135,16 +164,16 @@ class BacktestBroker(BrokerAdapter):
             )
         elif pos.direction == Direction.BULLISH:
             if nq_bar.low <= pos.stop_loss:
-                exit_price = pos.stop_loss - self.slippage_pts
+                exit_price = min(pos.stop_loss, nq_bar.open) - self.slippage_pts
                 exit_reason = "BREAK_EVEN" if pos.be_moved and abs(pos.stop_loss - pos.entry_price) <= self.config.instrument.tick_size else "STOP_LOSS"
-            elif nq_bar.high >= pos.take_profit:
+            elif not limit_filled and nq_bar.high >= pos.take_profit:
                 exit_price = pos.take_profit
                 exit_reason = "TAKE_PROFIT"
         else:
             if nq_bar.high >= pos.stop_loss:
-                exit_price = pos.stop_loss + self.slippage_pts
+                exit_price = max(pos.stop_loss, nq_bar.open) + self.slippage_pts
                 exit_reason = "BREAK_EVEN" if pos.be_moved and abs(pos.stop_loss - pos.entry_price) <= self.config.instrument.tick_size else "STOP_LOSS"
-            elif nq_bar.low <= pos.take_profit:
+            elif not limit_filled and nq_bar.low <= pos.take_profit:
                 exit_price = pos.take_profit
                 exit_reason = "TAKE_PROFIT"
 
@@ -195,30 +224,12 @@ def run_backtest(
     broker = BacktestBroker(cfg)
     engine = PBStrategyEngine(cfg, broker, calendar=calendar)
 
+    last_bar = None
     for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
-        # First check fills/exits on incoming bar
-        closed = broker.process_bar(nq_bar)
-        if closed is not None:
-            engine.on_trade_closed(closed)
-            engine.active_position = None
-            engine.risk.equity = broker.balance
-        elif broker.position is not None and engine.active_position is None:
-            engine.active_position = broker.position
-
-        # Run strategy logic on closed 1m bar pair
-        engine.on_1m_pair(nq_bar, es_bar)
-
-        # Keep engine position synced to broker's actual post-slippage fill price
-        if broker.position is not None and engine.active_position is not None:
-            engine.active_position.entry_price = broker.position.entry_price
-
-        # If strategy triggered an immediate Target SMT market exit, settle it on this bar
-        if broker.position is not None and "pending_market_close_reason" in broker.position.metadata:
-            closed = broker.process_bar(nq_bar)
-            if closed is not None:
-                engine.on_trade_closed(closed)
-                engine.active_position = None
-                engine.risk.equity = broker.balance
+        process_pair(engine, broker, nq_bar, es_bar)
+        last_bar = nq_bar
+    if last_bar is not None:
+        settle_end_of_data(engine, broker, last_bar)
 
     return BacktestResult(
         initial_balance=cfg.account_balance,
@@ -227,3 +238,26 @@ def run_backtest(
         rejections=engine.rejections,
         equity_curve=broker.equity_curve,
     )
+
+
+def _sync_broker(engine: PBStrategyEngine, broker: BacktestBroker, closed: Optional[ClosedTrade]) -> None:
+    if closed is not None:
+        engine.on_trade_closed(closed)
+    engine.active_position = broker.position
+    engine.risk.equity = broker.balance
+
+
+def process_pair(engine: PBStrategyEngine, broker: BacktestBroker, nq_bar: Bar, es_bar: Bar, warmup: bool = False) -> None:
+    """Shared chronological execution path for replay and polling."""
+    broker.expire_pending(nq_bar, es_bar)
+    closed = broker.process_bar(nq_bar)
+    _sync_broker(engine, broker, closed)
+    engine.on_1m_pair(nq_bar, es_bar, allow_entry=not warmup and broker.pending_order is None)
+    _sync_broker(engine, broker, broker.process_market_close(nq_bar))
+
+
+def settle_end_of_data(engine: PBStrategyEngine, broker: BacktestBroker, bar: Bar) -> None:
+    broker.pending_order = None
+    if broker.position is not None:
+        broker.close_position_market(broker.position.symbol, "END_OF_DATA")
+        _sync_broker(engine, broker, broker.process_market_close(bar))

@@ -8,6 +8,7 @@ from pb_bot.backtest.report import format_report
 from pb_bot.backtest.simulator import run_backtest
 from pb_bot.backtest.visualizer import generate_html_report
 from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode
+from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.data.feed import (
     generate_synthetic_multi_day_suite,
     generate_synthetic_ny_session,
@@ -24,6 +25,7 @@ def main() -> None:
     parser.add_argument("--compare", action="store_true", help="Compare all Entry x Break-Even config modes")
     parser.add_argument("--ablation", action="store_true", help="Run filter ablation study across Phase 4 gates")
     parser.add_argument("--am-end", default="11:00", help="NY AM window end HH:MM (e.g. 11:00 or 11:30)")
+    parser.add_argument("--calendar", type=Path, help="NY-time news CSV")
     parser.add_argument("--html", type=Path, help="Export visual HTML report to this path")
     parser.add_argument(
         "--entry-mode",
@@ -55,17 +57,21 @@ def main() -> None:
         allow_pm_session=args.allow_pm,
     )
 
+    calendar = EconomicCalendar.from_csv(args.calendar) if args.calendar else None
+    if calendar is None:
+        print("WARNING: no news calendar supplied; news filters are inactive.")
+
     if args.ablation:
-        ab_rows = run_ablation_study(nq_bars, es_bars, cfg)
+        ab_rows = run_ablation_study(nq_bars, es_bars, cfg, calendar=calendar)
         print(format_ablation_table(ab_rows))
         print()
 
     if args.compare:
-        rows = run_comparison_matrix(nq_bars, es_bars, cfg)
+        rows = run_comparison_matrix(nq_bars, es_bars, cfg, calendar=calendar)
         print(format_comparison_table(rows))
         print()
 
-    result = run_backtest(nq_bars, es_bars, cfg)
+    result = run_backtest(nq_bars, es_bars, cfg, calendar=calendar)
     print(format_report(result, verbose=args.verbose))
 
     if args.html:
