@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 from datetime import time
@@ -7,7 +8,7 @@ from pb_bot.backtest.compare import format_comparison_table, run_comparison_matr
 from pb_bot.backtest.report import format_report
 from pb_bot.backtest.simulator import run_backtest
 from pb_bot.backtest.visualizer import generate_html_report
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.data.feed import (
     generate_synthetic_multi_day_suite,
@@ -25,6 +26,8 @@ def main() -> None:
     parser.add_argument("--compare", action="store_true", help="Compare all Entry x Break-Even config modes")
     parser.add_argument("--ablation", action="store_true", help="Run filter ablation study across Phase 4 gates")
     parser.add_argument("--am-end", default="11:00", help="NY AM window end HH:MM (e.g. 11:00 or 11:30)")
+    parser.add_argument("--narrative-mode", choices=[m.value for m in NarrativeMode], default=NarrativeMode.OBSERVE.value)
+    parser.add_argument("--narrative-log", type=Path, help="Write narrative transitions as JSONL")
     parser.add_argument("--calendar", type=Path, help="NY-time news CSV")
     parser.add_argument("--html", type=Path, help="Export visual HTML report to this path")
     parser.add_argument(
@@ -55,6 +58,7 @@ def main() -> None:
         entry_mode=EntryOrderMode(args.entry_mode),
         be_mode=BreakEvenMode(args.be_mode),
         allow_pm_session=args.allow_pm,
+        narrative_mode=NarrativeMode(args.narrative_mode),
     )
 
     calendar = EconomicCalendar.from_csv(args.calendar) if args.calendar else None
@@ -72,7 +76,11 @@ def main() -> None:
         print()
 
     result = run_backtest(nq_bars, es_bars, cfg, calendar=calendar)
+    print(f"Narrative mode: {cfg.narrative_mode.value} | transitions: {len(result.narrative_events)}")
     print(format_report(result, verbose=args.verbose))
+    if args.narrative_log:
+        args.narrative_log.parent.mkdir(parents=True, exist_ok=True)
+        args.narrative_log.write_text("".join(json.dumps(e) + "\n" for e in result.narrative_events), encoding="utf-8")
 
     if args.html:
         out = generate_html_report(result, nq_bars, args.html)

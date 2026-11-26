@@ -18,6 +18,7 @@ class BacktestResult:
     trades: List[ClosedTrade] = field(default_factory=list)
     rejections: List[RejectionRecord] = field(default_factory=list)
     equity_curve: List[Tuple[datetime, float]] = field(default_factory=list)
+    narrative_events: List[dict] = field(default_factory=list)
 
 
 class BacktestBroker(BrokerAdapter):
@@ -237,6 +238,7 @@ def run_backtest(
         trades=broker.trades,
         rejections=engine.rejections,
         equity_curve=broker.equity_curve,
+        narrative_events=engine.narrative.events,
     )
 
 
@@ -254,6 +256,15 @@ def process_pair(engine: PBStrategyEngine, broker: BacktestBroker, nq_bar: Bar, 
     _sync_broker(engine, broker, closed)
     engine.on_1m_pair(nq_bar, es_bar, allow_entry=not warmup and broker.pending_order is None)
     _sync_broker(engine, broker, broker.process_market_close(nq_bar))
+    # Cancel on information observed at this bar close, before the next bar can fill.
+    if broker.pending_order is not None:
+        _, req = broker.pending_order
+        narrative_id = req.metadata.get("narrative_id")
+        if narrative_id is not None and not engine.narrative.accepts_pending(
+            narrative_id, req.direction, nq_bar.timestamp
+        ):
+            broker.pending_order = None
+            engine._log_rejection(nq_bar.timestamp, "PENDING_NARRATIVE_INVALIDATED", req.reason)
 
 
 def settle_end_of_data(engine: PBStrategyEngine, broker: BacktestBroker, bar: Bar) -> None:

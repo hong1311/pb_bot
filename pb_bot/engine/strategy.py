@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
 
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.liquidity import LiquidityTracker
 from pb_bot.core.models import (
@@ -26,6 +26,7 @@ from pb_bot.core.sessions import SessionTracker, to_ny
 from pb_bot.data.resampler import MultiTimeframeResampler, SUPPORTED_TIMEFRAMES
 from pb_bot.engine.bias_profile import BiasAndProfileEngine, DailyProfile
 from pb_bot.engine.risk_manager import OpenPosition, RiskManager
+from pb_bot.engine.narrative import MarketNarrativeEngine
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class PBStrategyEngine:
         self.liquidity = LiquidityTracker()
         self.bias_engine = BiasAndProfileEngine(config)
         self.risk = RiskManager(config)
+        self.narrative = MarketNarrativeEngine()
 
         # Daily runtime state
         self._current_day = None
@@ -122,9 +124,12 @@ class PBStrategyEngine:
         es_closed = self.es_resampler.update(es_bar)
 
         newly_confirmed_ifvgs: Dict[str, List[IFVG]] = {}
+        created_fvgs: List[FVG] = []
         for tf, bars in nq_closed.items():
             for b in bars:
                 created_fvg, new_ifvgs = self.nq_fvgs[tf].update(b)
+                if created_fvg is not None:
+                    created_fvgs.append(created_fvg)
                 if tf == '5m' and created_fvg is not None and time(9, 30) <= to_ny(b.timestamp).time() < time(11, 0):
                     self.am_5m_fvg_count += 1
                 if new_ifvgs:
@@ -164,6 +169,13 @@ class PBStrategyEngine:
 
         # Update Daily Profile state
         bias_state = self.bias_engine.evaluate_daily_profile(ts, nq_sess, self._all_fvgs_by_tf(), current_price=nq_bar.close)
+
+        # Advance narrative even during warmup, outside execution hours, or in a trade.
+        self.narrative.update(
+            nq_bar, es_bar, bias_state.bias, nq_sess, es_sess,
+            self._all_fvgs_by_tf(), created_fvgs, newly_confirmed_ifvgs, nq_closed,
+            blocked=bias_state.seek_and_destroy_active or bias_state.profile == DailyProfile.SEEK_AND_DESTROY,
+        )
 
         # Track 09:30 Judas manipulation away from 09:30 open
         if nq_sess.open_930 is not None and ts.time() >= time(9, 30):
@@ -287,6 +299,12 @@ class PBStrategyEngine:
         if not any(tf in newly_confirmed_ifvgs for tf in self.config.ifvg_scan_ladder):
             return None
 
+        narrative = self.narrative.current
+        strict_narrative = self.config.narrative_mode == NarrativeMode.STRICT
+        if strict_narrative and (narrative is None or not narrative.can_enter(direction, ts)):
+            self._log_rejection(ts, "NARRATIVE_NOT_READY", narrative.phase.value if narrative else "NO_DELIVERY_SOURCE")
+            return None
+
         # 4. Highest-Timeframe IFVG Selection (5m -> 4m -> 3m -> 2m -> 1m)
         chosen_ifvg, is_judas_override = self._select_highest_tf_ifvg(
             direction, newly_confirmed_ifvgs, ts, nq_bar
@@ -379,16 +397,20 @@ class PBStrategyEngine:
             self._log_rejection(ts, "SL_TOO_WIDE", f"SL={abs(entry_price - stop_loss):.2f}pts > max {self.config.max_stop_pts:.1f}pts")
             return None
 
-        dol_candidates = self.liquidity.collect_dol_targets(
-            direction=direction,
-            current_price=entry_price,
-            now=ts,
-            nq_session=nq_sess,
-            es_session=es_sess,
-            unfilled_fvgs=self._collect_unfilled_fvgs(("5m", "15m", "1H", "4H", "1D")),
-            devils_marks=self.devils_marks.marks,
-            es_fvgs=[f for tf in ("5m", "15m", "1H", "4H") for f in self.es_fvgs[tf].fvgs],
-        )
+        if strict_narrative:
+            # A known DOL must satisfy RR; never skip it to manufacture a better RR.
+            dol_candidates = [narrative.primary_dol]
+        else:
+            dol_candidates = self.liquidity.collect_dol_targets(
+                direction=direction,
+                current_price=entry_price,
+                now=ts,
+                nq_session=nq_sess,
+                es_session=es_sess,
+                unfilled_fvgs=self._collect_unfilled_fvgs(("5m", "15m", "1H", "4H", "1D")),
+                devils_marks=self.devils_marks.marks,
+                es_fvgs=[f for tf in ("5m", "15m", "1H", "4H") for f in self.es_fvgs[tf].fvgs],
+            )
         target_pool, rr = self.risk.select_target_with_rr_floor(
             direction, entry_price, stop_loss, dol_candidates
         )
@@ -424,6 +446,9 @@ class PBStrategyEngine:
                 "es_target_price": self._valid_es_target(direction, target_pool.correlated_price, es_bar),
                 "ifvg_tf": chosen_ifvg.source_fvg.timeframe,
                 "key_level": key_detail,
+                "narrative_mode": self.config.narrative_mode.value,
+                "narrative_id": narrative.id if strict_narrative else None,
+                "narrative": narrative.snapshot() if narrative else None,
             },
         )
         order_id = self.broker.submit_order(order)

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from pb_bot.backtest.simulator import BacktestBroker, process_pair, settle_end_of_data
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode
 from pb_bot.core.models import Bar, Direction, OrderRequest
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.sessions import NY_TZ, to_ny
@@ -72,6 +72,8 @@ class PaperAlertBroker(BacktestBroker):
                 "sl": order.stop_loss,
                 "tp": order.take_profit,
                 "reason": order.reason,
+                "narrative_mode": order.metadata.get("narrative_mode"),
+                "narrative": order.metadata.get("narrative"),
             },
         )
         return oid
@@ -132,6 +134,15 @@ class PaperAlertBroker(BacktestBroker):
             ])
 
 
+def _append_narrative_events(engine, log_dir, cursor):
+    events = engine.narrative.events
+    if cursor < len(events):
+        with (Path(log_dir) / "narrative_events.jsonl").open("a", encoding="utf-8") as f:
+            for event in events[cursor:]:
+                f.write(json.dumps(event) + "\n")
+    return len(events)
+
+
 def run_paper_replay(
     nq_bars: List[Bar],
     es_bars: List[Bar],
@@ -145,8 +156,10 @@ def run_paper_replay(
     engine = PBStrategyEngine(cfg, broker, calendar=calendar)
 
     last_bar = None
+    event_cursor = 0
     for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
         process_pair(engine, broker, nq_bar, es_bar)
+        event_cursor = _append_narrative_events(engine, log_dir, event_cursor)
         last_bar = nq_bar
         if pace_ms > 0:
             pytime.sleep(pace_ms / 1000.0)
@@ -211,6 +224,7 @@ def poll_live_yfinance(
     broker = PaperAlertBroker(cfg, log_dir=log_dir, webhook_url=webhook_url)
     engine = PBStrategyEngine(cfg, broker, calendar=calendar)
     seen_ts = None
+    event_cursor = 0
     started_mono = pytime.monotonic()
 
     print(
@@ -249,6 +263,7 @@ def poll_live_yfinance(
         new_count = 0
         for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
             process_pair(engine, broker, nq_bar, es_bar, warmup=is_warmup)
+            event_cursor = _append_narrative_events(engine, log_dir, event_cursor)
             seen_ts = nq_bar.timestamp
             new_count += 1
 
@@ -280,10 +295,11 @@ def main() -> None:
     parser.add_argument("--pace-ms", type=float, default=0.0, help="Optional delay per 1m bar in ms")
     parser.add_argument("--webhook", type=str, default=None, help="Optional Discord/Slack webhook URL")
     parser.add_argument("--allow-pm", action="store_true")
+    parser.add_argument("--narrative-mode", choices=[m.value for m in NarrativeMode], default=NarrativeMode.OBSERVE.value)
     parser.add_argument("--calendar", type=Path, help="NY-time news CSV")
     args = parser.parse_args()
 
-    cfg = BotConfig(allow_pm_session=args.allow_pm)
+    cfg = BotConfig(allow_pm_session=args.allow_pm, narrative_mode=NarrativeMode(args.narrative_mode))
     calendar = EconomicCalendar.from_csv(args.calendar) if args.calendar else None
     if calendar is None:
         print("WARNING: no news calendar supplied; news filters are inactive.", flush=True)
