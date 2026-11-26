@@ -199,6 +199,10 @@ class PlaybookEngine:
         }
         self._bars.append(bar)
 
+    def evidence_at(self, now):
+        """Fresh causal evidence observed on the just-closed minute."""
+        return tuple(e for e in self._evidence if e.observed_at == now)
+
     def _common(self, model, direction, now, bar, leg, narrative):
         if leg is None or not leg.start <= leg.extreme_at < now:
             return ModelDecision(model, None, "NO_CAUSAL_LEG")

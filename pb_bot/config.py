@@ -21,6 +21,11 @@ class PlaybookMode(str, Enum):
     STRICT = "STRICT"    # Require an eligible model AND strict narrative
 
 
+class StructureMode(str, Enum):
+    OBSERVE = "OBSERVE"  # Audit without replacing the V2.2 selector
+    STRICT = "STRICT"    # Require evidence-anchored structural selection
+
+
 class PlaybookModel(str, Enum):
     MAC = "MAC"
     CONTINUATION = "CONTINUATION"
@@ -98,6 +103,7 @@ class BotConfig:
     # Execution & Management Toggles
     narrative_mode: NarrativeMode = NarrativeMode.OBSERVE
     model_mode: PlaybookMode = PlaybookMode.OBSERVE
+    structure_mode: StructureMode = StructureMode.OBSERVE
     enabled_models: Tuple[PlaybookModel, ...] = tuple(PlaybookModel)
     model_evidence_minutes: int = 45
     po3_accumulation_minutes: int = 15
@@ -119,6 +125,8 @@ class BotConfig:
     enable_lunch_block: bool = True
 
     def __post_init__(self):
+        if self.structure_mode == StructureMode.STRICT and self.model_mode != PlaybookMode.STRICT:
+            raise ValueError("STRICT structure mode requires STRICT model and narrative modes")
         if self.model_mode == PlaybookMode.STRICT and self.narrative_mode != NarrativeMode.STRICT:
             raise ValueError("STRICT model mode requires STRICT narrative mode")
         if not self.enabled_models or any(m not in tuple(PlaybookModel) for m in self.enabled_models):

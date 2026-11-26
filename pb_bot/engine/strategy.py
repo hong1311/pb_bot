@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
 
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, StructureMode
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.liquidity import LiquidityTracker
 from pb_bot.core.models import (
@@ -28,6 +28,7 @@ from pb_bot.engine.bias_profile import BiasAndProfileEngine, DailyProfile
 from pb_bot.engine.risk_manager import OpenPosition, RiskManager
 from pb_bot.engine.narrative import MarketNarrativeEngine
 from pb_bot.engine.playbook import ManipulationLeg, PlaybookEngine
+from pb_bot.engine.structure import StructureEngine
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,8 @@ class PBStrategyEngine:
         self.risk = RiskManager(config)
         self.narrative = MarketNarrativeEngine()
         self.playbook = PlaybookEngine(config)
+        self.structure = StructureEngine(config)
+        self._structural_decision = None
 
         # Daily runtime state
         self._current_day = None
@@ -181,6 +184,8 @@ class PBStrategyEngine:
         )
 
         self.playbook.update(nq_bar, nq_sess, self._all_fvgs_by_tf(), self.liquidity.nq_swings)
+        self.structure.update(nq_bar, nq_sess.trading_day, nq_closed, created_fvgs,
+                              newly_confirmed_ifvgs, self.playbook.evidence_at(ts))
 
         # Track 09:30 Judas manipulation away from 09:30 open
         if nq_sess.open_930 is not None and ts.time() >= time(9, 30):
@@ -467,6 +472,8 @@ class PBStrategyEngine:
                 "narrative_id": narrative.id if strict_narrative else None,
                 "narrative": narrative.snapshot() if narrative else None,
                 "model_mode": self.config.model_mode.value,
+                "structure_mode": self.config.structure_mode.value,
+                "structural_leg": self._structural_decision.leg.snapshot() if self._structural_decision and self._structural_decision.leg else None,
                 "playbook_model": model_decision.model.value if model_decision else None,
                 "model_evidence": model_decision.evidence.snapshot() if model_decision else None,
                 "model_key_level_id": matched_fvg.id if strict_models and matched_fvg else None,
@@ -523,6 +530,15 @@ class PBStrategyEngine:
     ) -> Tuple[Optional[IFVG], bool]:
         self._selected_leg_extreme = None
         self._selected_leg = None
+        self._structural_decision = self.structure.audit(direction, ts, newly_confirmed_ifvgs)
+        if self.config.structure_mode == StructureMode.STRICT:
+            decision = self._structural_decision
+            if decision.ifvg is None:
+                self._log_rejection(ts, "STRUCTURAL_LEG_REQUIRED", decision.reason)
+                return None, False
+            self._selected_leg = decision.leg.leg
+            self._selected_leg_extreme = decision.leg.extreme
+            return decision.ifvg, False
         # 09:30 AM Judas 1m override (Building Discretion [26:45])
         if (
             self.config.enable_0930_judas_1m_override
