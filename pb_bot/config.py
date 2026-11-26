@@ -11,6 +11,11 @@ class EntryOrderMode(str, Enum):
     LIMIT_CISD_OPEN = "LIMIT_CISD_OPEN"
 
 
+class NarrativeMode(str, Enum):
+    OBSERVE = "OBSERVE"  # Record the new narrative without changing V2.0 orders
+    STRICT = "STRICT"    # Require a pre-established narrative and its locked DOL
+
+
 class BreakEvenMode(str, Enum):
     OFF = "OFF"
     STRICT_INTERNAL = "STRICT_INTERNAL"  # Any internal high/low wick (Breaker Blocks rule)
@@ -80,6 +85,7 @@ class BotConfig:
     continuation_key_level_min_tf: str = "5m"
 
     # Execution & Management Toggles
+    narrative_mode: NarrativeMode = NarrativeMode.OBSERVE
     entry_mode: EntryOrderMode = EntryOrderMode.MARKET_ON_CLOSE
     be_mode: BreakEvenMode = BreakEvenMode.SWING_5M
     enable_target_smt_exit: bool = True
