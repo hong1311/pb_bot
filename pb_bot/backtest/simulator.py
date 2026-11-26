@@ -20,6 +20,7 @@ class BacktestResult:
     equity_curve: List[Tuple[datetime, float]] = field(default_factory=list)
     narrative_events: List[dict] = field(default_factory=list)
     model_events: List[dict] = field(default_factory=list)
+    structure_events: List[dict] = field(default_factory=list)
 
 
 class BacktestBroker(BrokerAdapter):
@@ -241,6 +242,7 @@ def run_backtest(
         equity_curve=broker.equity_curve,
         narrative_events=engine.narrative.events,
         model_events=engine.playbook.events,
+        structure_events=engine.structure.events,
     )
 
 
