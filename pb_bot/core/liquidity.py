@@ -347,6 +347,25 @@ class LiquidityTracker:
                     )
         return pools
 
+    @staticmethod
+    def _find_correlated_es_fvg(
+        nq_fvg: FVG, es_fvgs: Optional[List[FVG]]
+    ) -> Optional[FVG]:
+        if not es_fvgs:
+            return None
+        tol_map = {"5m": 600, "15m": 1800, "1H": 7200, "4H": 28800}
+        max_delta = tol_map.get(nq_fvg.timeframe, 1800)
+        best: Optional[FVG] = None
+        best_delta = float("inf")
+        for ef in es_fvgs:
+            if ef.timeframe != nq_fvg.timeframe or ef.direction != nq_fvg.direction:
+                continue
+            delta = abs((ef.created_at - nq_fvg.created_at).total_seconds())
+            if delta <= max_delta and delta < best_delta:
+                best_delta = delta
+                best = ef
+        return best
+
     def collect_dol_targets(
         self,
         direction: Direction,
@@ -356,6 +375,7 @@ class LiquidityTracker:
         es_session: Optional[DailySessionState],
         unfilled_fvgs: List[FVG],
         devils_marks: List[DevilsMark],
+        es_fvgs: Optional[List[FVG]] = None,
     ) -> List[LiquidityPool]:
         """Collects all valid DOL targets ahead of price (strictly excludes Orderblocks)."""
         candidates: List[LiquidityPool] = []
@@ -428,14 +448,29 @@ class LiquidityTracker:
                 es_session.data_830_low if es_session else None,
             )
 
-        # 2. Unfilled FVGs (5m/15m/1H/4H/1D) and ITH/ITL inside FVGs
+        # 2. Unfilled FVGs (5m/15m/1H/4H/1D) and ITH/ITL inside FVGs (paired with ES FVG when available)
         for fvg in unfilled_fvgs:
+            es_match = self._find_correlated_es_fvg(fvg, es_fvgs)
             if fvg.state == FVGState.UNFILLED_TARGET:
                 edge = fvg.bottom if direction == Direction.BULLISH else fvg.top
-                add_if_ahead("UNFILLED_FVG", edge, fvg.timeframe, f"{fvg.timeframe}_UNFILLED_FVG")
+                es_edge = (
+                    (es_match.bottom if direction == Direction.BULLISH else es_match.top)
+                    if (es_match is not None and es_match.state == FVGState.UNFILLED_TARGET)
+                    else None
+                )
+                add_if_ahead("UNFILLED_FVG", edge, fvg.timeframe, f"{fvg.timeframe}_UNFILLED_FVG", es_edge)
             if fvg.internal_extreme is not None and not fvg.internal_extreme_swept:
                 kind = "ITH" if direction == Direction.BULLISH else "ITL"
-                add_if_ahead(kind, fvg.internal_extreme, fvg.timeframe, f"{fvg.timeframe}_{kind}")
+                es_ext = (
+                    es_match.internal_extreme
+                    if (
+                        es_match is not None
+                        and es_match.internal_extreme is not None
+                        and not es_match.internal_extreme_swept
+                    )
+                    else None
+                )
+                add_if_ahead(kind, fvg.internal_extreme, fvg.timeframe, f"{fvg.timeframe}_{kind}", es_ext)
 
         # 3. Devil's Marks
         for dm in devils_marks[-5:]:

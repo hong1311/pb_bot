@@ -381,6 +381,7 @@ class PBStrategyEngine:
             es_session=es_sess,
             unfilled_fvgs=self._collect_unfilled_fvgs(("5m", "15m", "1H", "4H", "1D")),
             devils_marks=self.devils_marks.marks,
+            es_fvgs=[f for tf in ("5m", "15m", "1H", "4H") for f in self.es_fvgs[tf].fvgs],
         )
         target_pool, rr = self.risk.select_target_with_rr_floor(
             direction, entry_price, stop_loss, dol_candidates
