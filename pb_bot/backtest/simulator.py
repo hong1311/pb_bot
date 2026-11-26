@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
-from pb_bot.config import BotConfig
+from pb_bot.config import BotConfig, RegimeMode
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.models import Bar, BrokerAdapter, Direction, OrderRequest
 from pb_bot.core.sessions import SessionTracker, cme_trading_date, to_ny
@@ -22,6 +22,7 @@ class BacktestResult:
     model_events: List[dict] = field(default_factory=list)
     structure_events: List[dict] = field(default_factory=list)
     discretion_events: List[dict] = field(default_factory=list)
+    regime_events: List[dict] = field(default_factory=list)
 
 
 class BacktestBroker(BrokerAdapter):
@@ -245,6 +246,7 @@ def run_backtest(
         model_events=engine.playbook.events,
         structure_events=engine.structure.events,
         discretion_events=engine.discretion.events,
+        regime_events=engine.regime.events,
     )
 
 
@@ -258,6 +260,13 @@ def _sync_broker(engine: PBStrategyEngine, broker: BacktestBroker, closed: Optio
 def process_pair(engine: PBStrategyEngine, broker: BacktestBroker, nq_bar: Bar, es_bar: Bar, warmup: bool = False) -> None:
     """Shared chronological execution path for replay and polling."""
     broker.expire_pending(nq_bar, es_bar)
+    if broker.pending_order is not None and engine.config.regime_mode == RegimeMode.STRICT:
+        reasons = engine.regime.pending_reasons(nq_bar.timestamp)
+        # These time/schedule constraints are known before the bar starts, unlike
+        # price-derived regime changes observed at the bar close.
+        if reasons:
+            broker.pending_order = None
+            engine._log_rejection(nq_bar.timestamp, "PENDING_REGIME_CANCELLED", ",".join(reasons))
     closed = broker.process_bar(nq_bar)
     _sync_broker(engine, broker, closed)
     engine.on_1m_pair(nq_bar, es_bar, allow_entry=not warmup and broker.pending_order is None)
@@ -266,7 +275,10 @@ def process_pair(engine: PBStrategyEngine, broker: BacktestBroker, nq_bar: Bar, 
     if broker.pending_order is not None:
         _, req = broker.pending_order
         narrative_id = req.metadata.get("narrative_id")
-        if narrative_id is not None and not engine.narrative.accepts_pending(
+        if engine.config.regime_mode == RegimeMode.STRICT and engine.regime.blocked:
+            broker.pending_order = None
+            engine._log_rejection(nq_bar.timestamp, "PENDING_REGIME_CANCELLED", ",".join(engine.regime.reasons))
+        elif narrative_id is not None and not engine.narrative.accepts_pending(
             narrative_id, req.direction, nq_bar.timestamp
         ):
             broker.pending_order = None

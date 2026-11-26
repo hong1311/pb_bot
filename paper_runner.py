@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from pb_bot.backtest.simulator import BacktestBroker, process_pair, settle_end_of_data
-from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, PlaybookModel, StructureMode, DiscretionMode
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, PlaybookModel, StructureMode, DiscretionMode, RegimeMode
 from pb_bot.core.models import Bar, Direction, OrderRequest
 from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.sessions import NY_TZ, to_ny
@@ -77,6 +77,8 @@ class PaperAlertBroker(BacktestBroker):
                 "model_mode": order.metadata.get("model_mode"),
                 "structure_mode": order.metadata.get("structure_mode"),
                 "discretion_mode": order.metadata.get("discretion_mode"),
+                "regime_mode": order.metadata.get("regime_mode"),
+                "regime": order.metadata.get("regime"),
                 "discretion": order.metadata.get("discretion"),
                 "structural_leg": order.metadata.get("structural_leg"),
                 "playbook_model": order.metadata.get("playbook_model"),
@@ -166,12 +168,14 @@ def run_paper_replay(
     model_cursor = 0
     structure_cursor = 0
     discretion_cursor = 0
+    regime_cursor = 0
     for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
         process_pair(engine, broker, nq_bar, es_bar)
         event_cursor = _append_events(engine.narrative.events, log_dir, event_cursor, "narrative_events.jsonl")
         model_cursor = _append_events(engine.playbook.events, log_dir, model_cursor, "model_events.jsonl")
         structure_cursor = _append_events(engine.structure.events, log_dir, structure_cursor, "structure_events.jsonl")
         discretion_cursor = _append_events(engine.discretion.events, log_dir, discretion_cursor, "discretion_events.jsonl")
+        regime_cursor = _append_events(engine.regime.events, log_dir, regime_cursor, "regime_events.jsonl")
         last_bar = nq_bar
         if pace_ms > 0:
             pytime.sleep(pace_ms / 1000.0)
@@ -240,6 +244,7 @@ def poll_live_yfinance(
     model_cursor = 0
     structure_cursor = 0
     discretion_cursor = 0
+    regime_cursor = 0
     started_mono = pytime.monotonic()
 
     print(
@@ -282,6 +287,7 @@ def poll_live_yfinance(
             model_cursor = _append_events(engine.playbook.events, log_dir, model_cursor, "model_events.jsonl")
             structure_cursor = _append_events(engine.structure.events, log_dir, structure_cursor, "structure_events.jsonl")
             discretion_cursor = _append_events(engine.discretion.events, log_dir, discretion_cursor, "discretion_events.jsonl")
+            regime_cursor = _append_events(engine.regime.events, log_dir, regime_cursor, "regime_events.jsonl")
             seen_ts = nq_bar.timestamp
             new_count += 1
 
@@ -314,6 +320,8 @@ def main() -> None:
     parser.add_argument("--webhook", type=str, default=None, help="Optional Discord/Slack webhook URL")
     parser.add_argument("--allow-pm", action="store_true")
     parser.add_argument("--narrative-mode", choices=[m.value for m in NarrativeMode], default=NarrativeMode.OBSERVE.value)
+    parser.add_argument("--regime-mode", choices=[m.value for m in RegimeMode], default=RegimeMode.OBSERVE.value)
+    parser.add_argument("--require-calendar", action="store_true", help="Block strict-mode entries unless an economic calendar is supplied")
     parser.add_argument("--discretion-mode", choices=[m.value for m in DiscretionMode], default=DiscretionMode.OBSERVE.value)
     parser.add_argument("--validated-wick-stop", action="store_true", help="Experimental: validated midpoint stop, strict discretion market entries only")
     parser.add_argument("--structure-mode", choices=[m.value for m in StructureMode], default=StructureMode.OBSERVE.value)
@@ -322,6 +330,8 @@ def main() -> None:
     parser.add_argument("--calendar", type=Path, help="NY-time news CSV")
     args = parser.parse_args()
 
+    if args.require_calendar and args.regime_mode != "STRICT":
+        parser.error("--require-calendar requires --regime-mode STRICT")
     if args.discretion_mode == "STRICT" and args.structure_mode != "STRICT":
         parser.error("--discretion-mode STRICT requires --structure-mode STRICT --model-mode STRICT --narrative-mode STRICT")
     if args.validated_wick_stop and args.discretion_mode != "STRICT":
@@ -332,11 +342,12 @@ def main() -> None:
         parser.error("--model-mode STRICT requires --narrative-mode STRICT")
     cfg = BotConfig(allow_pm_session=args.allow_pm, narrative_mode=NarrativeMode(args.narrative_mode),
                     model_mode=PlaybookMode(args.model_mode), structure_mode=StructureMode(args.structure_mode), discretion_mode=DiscretionMode(args.discretion_mode),
+                    regime_mode=RegimeMode(args.regime_mode), regime_require_calendar=args.require_calendar,
                     enable_validated_wick_stop=args.validated_wick_stop,
                     enabled_models=tuple(PlaybookModel(m) for m in args.models))
     calendar = EconomicCalendar.from_csv(args.calendar) if args.calendar else None
     if calendar is None:
-        print("WARNING: no news calendar supplied; news filters are inactive.", flush=True)
+        print("WARNING: calendar required; STRICT regime blocks entries." if args.require_calendar else "WARNING: no news calendar supplied; news filters are inactive.", flush=True)
     if args.live:
         poll_live_yfinance(
             cfg,
