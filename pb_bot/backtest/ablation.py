@@ -6,6 +6,7 @@ from pb_bot.backtest.compare import _summarize
 from pb_bot.backtest.simulator import run_backtest
 from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode
 from pb_bot.core.models import Bar
+from pb_bot.core.calendar import EconomicCalendar
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ def run_ablation_study(
     nq_bars: List[Bar],
     es_bars: List[Bar],
     base_config: Optional[BotConfig] = None,
+    calendar: Optional[EconomicCalendar] = None,
 ) -> List[AblationRow]:
     """Benchmarks Core PB vs. incremental Phase 4 regime filters & 11:30 delivery window."""
     base = base_config or BotConfig(
@@ -80,7 +82,7 @@ def run_ablation_study(
     rows: List[AblationRow] = []
     for name, cfg in variants:
         print(f'  Running ablation: {name}...', flush=True)
-        res = run_backtest(nq_bars, es_bars, cfg)
+        res = run_backtest(nq_bars, es_bars, cfg, calendar=calendar)
         s = _summarize(res, cfg.entry_mode.value, cfg.be_mode.value)
         rows.append(
             AblationRow(

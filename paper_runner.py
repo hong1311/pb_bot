@@ -2,13 +2,14 @@ import argparse
 import csv
 import json
 import time as pytime
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, List, Optional
 
-from pb_bot.backtest.simulator import BacktestBroker
+from pb_bot.backtest.simulator import BacktestBroker, process_pair, settle_end_of_data
 from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode
 from pb_bot.core.models import Bar, Direction, OrderRequest
+from pb_bot.core.calendar import EconomicCalendar
 from pb_bot.core.sessions import NY_TZ, to_ny
 from pb_bot.data.feed import load_csv_bars, sync_dual_feed
 from pb_bot.engine.strategy import PBStrategyEngine
@@ -138,21 +139,19 @@ def run_paper_replay(
     log_dir: Path,
     pace_ms: float = 0.0,
     webhook_url: Optional[str] = None,
+    calendar: Optional[EconomicCalendar] = None,
 ) -> None:
     broker = PaperAlertBroker(cfg, log_dir=log_dir, webhook_url=webhook_url)
-    engine = PBStrategyEngine(cfg, broker)
+    engine = PBStrategyEngine(cfg, broker, calendar=calendar)
 
+    last_bar = None
     for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
-        closed = broker.process_bar(nq_bar)
-        if closed is not None:
-            engine.on_trade_closed(closed)
-            engine.active_position = None
-            engine.risk.equity = broker.balance
-        engine.on_1m_pair(nq_bar, es_bar)
-        if broker.position is not None and engine.active_position is not None:
-            engine.active_position.entry_price = broker.position.entry_price
+        process_pair(engine, broker, nq_bar, es_bar)
+        last_bar = nq_bar
         if pace_ms > 0:
             pytime.sleep(pace_ms / 1000.0)
+    if last_bar is not None:
+        settle_end_of_data(engine, broker, last_bar)
 
     print(
         f"\nPaper run complete | Final Balance: ${broker.balance:,.2f} | "
@@ -200,6 +199,7 @@ def poll_live_yfinance(
     ny_hours_only: bool = False,
     max_minutes: Optional[float] = None,
     webhook_url: Optional[str] = None,
+    calendar: Optional[EconomicCalendar] = None,
 ) -> None:
     try:
         import yfinance as yf
@@ -209,7 +209,7 @@ def poll_live_yfinance(
     from datetime import timedelta
 
     broker = PaperAlertBroker(cfg, log_dir=log_dir, webhook_url=webhook_url)
-    engine = PBStrategyEngine(cfg, broker)
+    engine = PBStrategyEngine(cfg, broker, calendar=calendar)
     seen_ts = None
     started_mono = pytime.monotonic()
 
@@ -238,6 +238,9 @@ def poll_live_yfinance(
         nq_bars = _df_to_bars(nq_df, "NQ", "1m")
         es_bars = _df_to_bars(es_df, "ES", "1m")
 
+        nq_bars = [b for b in nq_bars if b.timestamp + timedelta(minutes=1) <= now_u]
+        es_bars = [b for b in es_bars if b.timestamp + timedelta(minutes=1) <= now_u]
+
         if seen_ts is not None:
             nq_bars = [b for b in nq_bars if b.timestamp > seen_ts]
             es_bars = [b for b in es_bars if b.timestamp > seen_ts]
@@ -245,20 +248,7 @@ def poll_live_yfinance(
         is_warmup = seen_ts is None
         new_count = 0
         for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
-            closed = broker.process_bar(nq_bar)
-            if closed is not None:
-                engine.on_trade_closed(closed)
-                engine.active_position = None
-                engine.risk.equity = broker.balance
-            if is_warmup:
-                saved_cap = engine.config.max_trades_per_day
-                engine.config = type(engine.config)(**{**vars(engine.config), "max_trades_per_day": 0})
-                engine.on_1m_pair(nq_bar, es_bar)
-                engine.config = type(engine.config)(**{**vars(engine.config), "max_trades_per_day": saved_cap})
-            else:
-                engine.on_1m_pair(nq_bar, es_bar)
-            if broker.position is not None and engine.active_position is not None:
-                engine.active_position.entry_price = broker.position.entry_price
+            process_pair(engine, broker, nq_bar, es_bar, warmup=is_warmup)
             seen_ts = nq_bar.timestamp
             new_count += 1
 
@@ -290,17 +280,13 @@ def main() -> None:
     parser.add_argument("--pace-ms", type=float, default=0.0, help="Optional delay per 1m bar in ms")
     parser.add_argument("--webhook", type=str, default=None, help="Optional Discord/Slack webhook URL")
     parser.add_argument("--allow-pm", action="store_true")
+    parser.add_argument("--calendar", type=Path, help="NY-time news CSV")
     args = parser.parse_args()
 
-    cfg = BotConfig(
-        am_start=time(9, 35),
-        am_end=time(11, 30),
-        entry_mode=EntryOrderMode.MARKET_ON_CLOSE,
-        be_mode=BreakEvenMode.OFF,
-        enable_10am_macro_pause=True,
-        continuation_size_mult=1.0,
-        allow_pm_session=args.allow_pm,
-    )
+    cfg = BotConfig(allow_pm_session=args.allow_pm)
+    calendar = EconomicCalendar.from_csv(args.calendar) if args.calendar else None
+    if calendar is None:
+        print("WARNING: no news calendar supplied; news filters are inactive.", flush=True)
     if args.live:
         poll_live_yfinance(
             cfg,
@@ -311,13 +297,14 @@ def main() -> None:
             ny_hours_only=args.ny_hours_only,
             max_minutes=args.max_minutes,
             webhook_url=args.webhook,
+            calendar=calendar,
         )
         return
     if not args.nq_csv or not args.es_csv:
         parser.error('--nq-csv and --es-csv are required unless --live is set')
     nq_bars = load_csv_bars(args.nq_csv, "NQ", "1m")
     es_bars = load_csv_bars(args.es_csv, "ES", "1m")
-    run_paper_replay(nq_bars, es_bars, cfg, args.log_dir, pace_ms=args.pace_ms, webhook_url=args.webhook)
+    run_paper_replay(nq_bars, es_bars, cfg, args.log_dir, pace_ms=args.pace_ms, webhook_url=args.webhook, calendar=calendar)
 
 
 if __name__ == "__main__":

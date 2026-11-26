@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 
 from pb_bot.config import BotConfig
 from pb_bot.core.models import Bar, CISD, Direction, FVG, FVGState
-from pb_bot.core.sessions import DailySessionState, to_ny
+from pb_bot.core.sessions import DailySessionState, cme_trading_date, to_ny
 
 
 class DailyProfile(str, Enum):
@@ -229,7 +229,7 @@ class BiasAndProfileEngine:
 
         for tf in ("1D", "4H", "1H", "30m"):
             for fvg in htf_fvgs_by_tf.get(tf, []):
-                if fvg.first_tap_at is not None:
+                if fvg.first_tap_at is not None and cme_trading_date(fvg.first_tap_at) == session.trading_day:
                     tap_t = to_ny(fvg.first_tap_at).time()
                     if time(2, 0) <= tap_t < time(5, 0) or tap_t >= time(20, 0):
                         return tf

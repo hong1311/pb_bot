@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 from pb_bot.backtest.simulator import BacktestResult, run_backtest
 from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode
 from pb_bot.core.models import Bar
+from pb_bot.core.calendar import EconomicCalendar
 
 
 @dataclass(frozen=True)
@@ -52,13 +53,14 @@ def run_comparison_matrix(
     nq_bars: List[Bar],
     es_bars: List[Bar],
     base_config: Optional[BotConfig] = None,
+    calendar: Optional[EconomicCalendar] = None,
 ) -> List[ComparisonRow]:
     base = base_config or BotConfig()
     rows: List[ComparisonRow] = []
     for entry_mode, be_mode in DEFAULT_MATRIX:
         print(f'  Running compare: {entry_mode.value} | {be_mode.value}...', flush=True)
         cfg = replace(base, entry_mode=entry_mode, be_mode=be_mode)
-        res = run_backtest(nq_bars, es_bars, cfg)
+        res = run_backtest(nq_bars, es_bars, cfg, calendar=calendar)
         rows.append(_summarize(res, entry_mode.value, be_mode.value))
     return rows
 
