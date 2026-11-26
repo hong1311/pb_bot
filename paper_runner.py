@@ -298,6 +298,7 @@ def main() -> None:
         entry_mode=EntryOrderMode.MARKET_ON_CLOSE,
         be_mode=BreakEvenMode.OFF,
         enable_10am_macro_pause=True,
+        continuation_size_mult=1.0,
         allow_pm_session=args.allow_pm,
     )
     if args.live:
