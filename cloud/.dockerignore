@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+*.sqlite3
+*.sqlite3-*
+*.db
+.env
+.env.*
+**/token
+*.log
+calendar_review.json
+warmup_cache

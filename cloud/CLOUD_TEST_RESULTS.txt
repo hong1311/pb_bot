@@ -1,0 +1,1 @@
+Cloud package regression: 224 offline tests passed; seven cloud tests rerun successfully after closing SQLite connections explicitly. Docker image and hosted runtime not tested.

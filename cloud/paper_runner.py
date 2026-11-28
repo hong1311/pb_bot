@@ -1,0 +1,372 @@
+import argparse
+import csv
+import json
+import time as pytime
+from datetime import datetime, time, timedelta
+from pathlib import Path
+from typing import Any, List, Optional
+
+from pb_bot.backtest.simulator import BacktestBroker, process_pair, settle_end_of_data
+from pb_bot.config import BotConfig, BreakEvenMode, EntryOrderMode, NarrativeMode, PlaybookMode, PlaybookModel, StructureMode, DiscretionMode, RegimeMode
+from pb_bot.core.models import Bar, Direction, OrderRequest
+from pb_bot.core.calendar import EconomicCalendar
+from pb_bot.core.sessions import NY_TZ, to_ny
+from pb_bot.data.feed import load_csv_bars, sync_dual_feed
+from pb_bot.engine.strategy import PBStrategyEngine
+
+
+class PaperAlertBroker(BacktestBroker):
+    """Paper-trading & alert broker: simulates fills/SL/TP/BE and appends events to JSONL + CSV."""
+
+    def __init__(
+        self,
+        config: BotConfig,
+        log_dir: Path,
+        webhook_url: Optional[str] = None,
+    ) -> None:
+        super().__init__(config)
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.webhook_url = webhook_url
+        self.events_path = self.log_dir / "paper_events.jsonl"
+        self.trades_csv_path = self.log_dir / "paper_trades.csv"
+        self._seen_trade_ids = set()
+        self.closed_count = 0
+
+    def _emit_event(self, event_type: str, payload: dict) -> None:
+        record = {
+            "logged_at_ny": datetime.now(NY_TZ).isoformat(),
+            "event": event_type,
+            **payload,
+        }
+        with self.events_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        msg = f"[PAPER {event_type}] {payload}"
+        print(msg, flush=True)
+
+        if self.webhook_url:
+            try:
+                import urllib.request
+
+                req = urllib.request.Request(
+                    self.webhook_url,
+                    data=json.dumps({"content": msg}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=3)
+            except Exception as exc:
+                print(f"  [Webhook warning] {exc}", flush=True)
+
+    def submit_order(self, order: OrderRequest) -> str:
+        oid = super().submit_order(order)
+        self._emit_event(
+            "ORDER_SUBMITTED",
+            {
+                "order_id": oid,
+                "direction": order.direction.value,
+                "qty": order.quantity,
+                "order_type": getattr(order.order_type, "value", order.order_type),
+                "price": getattr(order, 'entry_price', None),
+                "sl": order.stop_loss,
+                "tp": order.take_profit,
+                "reason": order.reason,
+                "narrative_mode": order.metadata.get("narrative_mode"),
+                "narrative": order.metadata.get("narrative"),
+                "model_mode": order.metadata.get("model_mode"),
+                "structure_mode": order.metadata.get("structure_mode"),
+                "discretion_mode": order.metadata.get("discretion_mode"),
+                "regime_mode": order.metadata.get("regime_mode"),
+                "regime": order.metadata.get("regime"),
+                "discretion": order.metadata.get("discretion"),
+                "structural_leg": order.metadata.get("structural_leg"),
+                "playbook_model": order.metadata.get("playbook_model"),
+                "model_evidence": order.metadata.get("model_evidence"),
+            },
+        )
+        return oid
+
+    def modify_stop_loss(self, order_id: str, new_stop: float, reason: str) -> None:
+        prev_stop = self.position.stop_loss if self.position else None
+        super().modify_stop_loss(order_id, new_stop, reason)
+        if prev_stop != new_stop:
+            self._emit_event(
+                "STOP_MODIFIED",
+                {
+                    "order_id": order_id,
+                    "old_sl": prev_stop,
+                    "new_sl": new_stop,
+                    "reason": reason,
+                },
+            )
+
+    def process_bar(self, bar: Bar) -> Optional[Any]:
+        closed = super().process_bar(bar)
+        if closed is not None and closed.order_id not in self._seen_trade_ids:
+            self._seen_trade_ids.add(closed.order_id)
+            self.closed_count += 1
+            self._emit_event(
+                "TRADE_CLOSED",
+                {
+                    "order_id": closed.order_id,
+                    "direction": closed.direction.value,
+                    "qty": closed.quantity,
+                    "entry": closed.entry_price,
+                    "exit": closed.exit_price,
+                    "pnl_dollars": round(closed.pnl_dollars, 2),
+                    "r_multiple": round(closed.r_multiple, 2),
+                    "exit_reason": closed.exit_reason,
+                    "opened_at": to_ny(closed.opened_at).isoformat(),
+                    "closed_at": to_ny(closed.closed_at).isoformat(),
+                },
+            )
+            self._append_trade_csv(closed)
+        return closed
+
+    def _append_trade_csv(self, t: Any) -> None:
+        write_header = not self.trades_csv_path.exists()
+        with self.trades_csv_path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow([
+                    "order_id", "direction", "qty", "opened_at", "closed_at",
+                    "entry", "exit", "sl", "tp", "pnl_dollars", "r_multiple",
+                    "exit_reason", "setup_reason",
+                ])
+            writer.writerow([
+                t.order_id, t.direction.value, t.quantity,
+                to_ny(t.opened_at).isoformat(), to_ny(t.closed_at).isoformat(),
+                t.entry_price, t.exit_price, t.initial_stop_loss, t.take_profit,
+                round(t.pnl_dollars, 2), round(t.r_multiple, 2),
+                t.exit_reason, t.setup_reason,
+            ])
+
+
+def _append_events(events, log_dir, cursor, filename):
+    if cursor < len(events):
+        with (Path(log_dir) / filename).open("a", encoding="utf-8") as f:
+            for event in events[cursor:]:
+                f.write(json.dumps(event) + "\n")
+    return len(events)
+
+
+def run_paper_replay(
+    nq_bars: List[Bar],
+    es_bars: List[Bar],
+    cfg: BotConfig,
+    log_dir: Path,
+    pace_ms: float = 0.0,
+    webhook_url: Optional[str] = None,
+    calendar: Optional[EconomicCalendar] = None,
+) -> None:
+    broker = PaperAlertBroker(cfg, log_dir=log_dir, webhook_url=webhook_url)
+    engine = PBStrategyEngine(cfg, broker, calendar=calendar)
+
+    last_bar = None
+    event_cursor = 0
+    model_cursor = 0
+    structure_cursor = 0
+    discretion_cursor = 0
+    regime_cursor = 0
+    for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
+        process_pair(engine, broker, nq_bar, es_bar)
+        event_cursor = _append_events(engine.narrative.events, log_dir, event_cursor, "narrative_events.jsonl")
+        model_cursor = _append_events(engine.playbook.events, log_dir, model_cursor, "model_events.jsonl")
+        structure_cursor = _append_events(engine.structure.events, log_dir, structure_cursor, "structure_events.jsonl")
+        discretion_cursor = _append_events(engine.discretion.events, log_dir, discretion_cursor, "discretion_events.jsonl")
+        regime_cursor = _append_events(engine.regime.events, log_dir, regime_cursor, "regime_events.jsonl")
+        last_bar = nq_bar
+        if pace_ms > 0:
+            pytime.sleep(pace_ms / 1000.0)
+    if last_bar is not None:
+        settle_end_of_data(engine, broker, last_bar)
+
+    print(
+        f"\nPaper run complete | Final Balance: ${broker.balance:,.2f} | "
+        f"Closed Trades: {broker.closed_count} | Logs: {log_dir.resolve()}",
+        flush=True,
+    )
+
+
+
+
+def _df_to_bars(df, symbol: str, timeframe: str = "1m") -> List[Bar]:
+    import pandas as pd
+    bars: List[Bar] = []
+    if df is None or df.empty:
+        return bars
+    sub = df.copy()
+    sub.columns = [str(c).lower() for c in sub.columns]
+    if sub.index.tz is None:
+        sub.index = sub.index.tz_localize(NY_TZ)
+    else:
+        sub.index = sub.index.tz_convert(NY_TZ)
+    for ts, row in sub.iterrows():
+        try:
+            o = float(row["open"])
+            h = float(row["high"])
+            l = float(row["low"])
+            c = float(row["close"])
+            v = float(row.get("volume", 0.0) or 0.0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if min(o, h, l, c) <= 0 or h < l:
+            continue
+        dt_val = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        bars.append(Bar(timestamp=dt_val, open=o, high=h, low=l, close=c, volume=v, symbol=symbol, timeframe=timeframe))
+    bars.sort(key=lambda b: b.timestamp)
+    return bars
+
+
+def poll_live_yfinance(
+    cfg: BotConfig,
+    log_dir: Path,
+    poll_sec: float = 60.0,
+    lookback_days: int = 2,
+    once: bool = False,
+    ny_hours_only: bool = False,
+    max_minutes: Optional[float] = None,
+    webhook_url: Optional[str] = None,
+    calendar: Optional[EconomicCalendar] = None,
+) -> None:
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise RuntimeError("yfinance is required for --live mode. Install with: pip install yfinance")
+
+    from datetime import timedelta
+
+    broker = PaperAlertBroker(cfg, log_dir=log_dir, webhook_url=webhook_url)
+    engine = PBStrategyEngine(cfg, broker, calendar=calendar)
+    seen_ts = None
+    event_cursor = 0
+    model_cursor = 0
+    structure_cursor = 0
+    discretion_cursor = 0
+    regime_cursor = 0
+    started_mono = pytime.monotonic()
+
+    print(
+        f"Starting live 1m polling (NQ=F / ES=F) every {poll_sec:.0f}s | "
+        f"NY window {cfg.am_start.strftime('%H:%M')}-{cfg.am_end.strftime('%H:%M')} | Logs: {log_dir.resolve()}",
+        flush=True,
+    )
+
+    while True:
+        now_ny = datetime.now(NY_TZ)
+        if ny_hours_only and (now_ny.weekday() >= 5 or not (time(9, 25) <= now_ny.time() <= time(11, 35))):
+            if once:
+                print(f"[{now_ny.strftime('%Y-%m-%d %H:%M:%S %Z')}] Outside NY AM window; skipping (--ny-hours-only).", flush=True)
+                break
+            pytime.sleep(max(15.0, min(poll_sec, 60.0)))
+            continue
+        now_utc = datetime.now(NY_TZ).astimezone(ZoneInfo("UTC")) if False else None
+        from datetime import timezone
+        now_u = datetime.now(timezone.utc)
+        start_u = now_u - timedelta(days=max(1, lookback_days))
+
+        nq_df = yf.Ticker("NQ=F").history(start=start_u, end=now_u, interval="1m", prepost=True)
+        es_df = yf.Ticker("ES=F").history(start=start_u, end=now_u, interval="1m", prepost=True)
+
+        nq_bars = _df_to_bars(nq_df, "NQ", "1m")
+        es_bars = _df_to_bars(es_df, "ES", "1m")
+
+        nq_bars = [b for b in nq_bars if b.timestamp + timedelta(minutes=1) <= now_u]
+        es_bars = [b for b in es_bars if b.timestamp + timedelta(minutes=1) <= now_u]
+
+        if seen_ts is not None:
+            nq_bars = [b for b in nq_bars if b.timestamp > seen_ts]
+            es_bars = [b for b in es_bars if b.timestamp > seen_ts]
+
+        is_warmup = seen_ts is None
+        new_count = 0
+        for nq_bar, es_bar in sync_dual_feed(nq_bars, es_bars):
+            process_pair(engine, broker, nq_bar, es_bar, warmup=is_warmup)
+            event_cursor = _append_events(engine.narrative.events, log_dir, event_cursor, "narrative_events.jsonl")
+            model_cursor = _append_events(engine.playbook.events, log_dir, model_cursor, "model_events.jsonl")
+            structure_cursor = _append_events(engine.structure.events, log_dir, structure_cursor, "structure_events.jsonl")
+            discretion_cursor = _append_events(engine.discretion.events, log_dir, discretion_cursor, "discretion_events.jsonl")
+            regime_cursor = _append_events(engine.regime.events, log_dir, regime_cursor, "regime_events.jsonl")
+            seen_ts = nq_bar.timestamp
+            new_count += 1
+
+        print(
+            f"[{datetime.now(NY_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] "
+            f"Processed {new_count} new bar pair(s) | Equity: ${broker.balance:,.2f} | Closed: {broker.closed_count}",
+            flush=True,
+        )
+
+        if once:
+            break
+        if max_minutes is not None and (pytime.monotonic() - started_mono) >= max_minutes * 60.0:
+            print(f'Reached --max-minutes ({max_minutes}); exiting cleanly.', flush=True)
+            break
+        pytime.sleep(max(5.0, poll_sec))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="PB Bot Paper-Trading & Alert Replay Runner")
+    parser.add_argument("--nq-csv", type=Path, default=None, help="Path to 1m NQ CSV (replay mode)")
+    parser.add_argument("--es-csv", type=Path, default=None, help="Path to 1m ES CSV (replay mode)")
+    parser.add_argument("--live", action="store_true", help="Poll live 1m NQ=F/ES=F bars via yfinance")
+    parser.add_argument("--poll-sec", type=float, default=60.0, help="Polling interval in seconds for --live")
+    parser.add_argument("--lookback-days", type=int, default=2, help="Warmup lookback days for --live")
+    parser.add_argument("--once", action="store_true", help="Run a single poll cycle in --live mode and exit")
+    parser.add_argument("--ny-hours-only", action="store_true", help="Only poll on weekdays between 09:25 and 11:35 ET")
+    parser.add_argument("--max-minutes", type=float, default=None, help="Stop cleanly after N minutes")
+    parser.add_argument("--log-dir", type=Path, default=Path("paper_logs"))
+    parser.add_argument("--pace-ms", type=float, default=0.0, help="Optional delay per 1m bar in ms")
+    parser.add_argument("--webhook", type=str, default=None, help="Optional Discord/Slack webhook URL")
+    parser.add_argument("--allow-pm", action="store_true")
+    parser.add_argument("--narrative-mode", choices=[m.value for m in NarrativeMode], default=NarrativeMode.OBSERVE.value)
+    parser.add_argument("--regime-mode", choices=[m.value for m in RegimeMode], default=RegimeMode.OBSERVE.value)
+    parser.add_argument("--require-calendar", action="store_true", help="Block strict-mode entries unless an economic calendar is supplied")
+    parser.add_argument("--discretion-mode", choices=[m.value for m in DiscretionMode], default=DiscretionMode.OBSERVE.value)
+    parser.add_argument("--validated-wick-stop", action="store_true", help="Experimental: validated midpoint stop, strict discretion market entries only")
+    parser.add_argument("--structure-mode", choices=[m.value for m in StructureMode], default=StructureMode.OBSERVE.value)
+    parser.add_argument("--model-mode", choices=[m.value for m in PlaybookMode], default=PlaybookMode.OBSERVE.value)
+    parser.add_argument("--models", nargs="+", choices=[m.value for m in PlaybookModel], default=[m.value for m in PlaybookModel])
+    parser.add_argument("--calendar", type=Path, help="NY-time news CSV")
+    args = parser.parse_args()
+
+    if args.require_calendar and args.regime_mode != "STRICT":
+        parser.error("--require-calendar requires --regime-mode STRICT")
+    if args.discretion_mode == "STRICT" and args.structure_mode != "STRICT":
+        parser.error("--discretion-mode STRICT requires --structure-mode STRICT --model-mode STRICT --narrative-mode STRICT")
+    if args.validated_wick_stop and args.discretion_mode != "STRICT":
+        parser.error("--validated-wick-stop requires --discretion-mode STRICT")
+    if args.structure_mode == "STRICT" and args.model_mode != "STRICT":
+        parser.error("--structure-mode STRICT requires --model-mode STRICT --narrative-mode STRICT")
+    if args.model_mode == "STRICT" and args.narrative_mode != "STRICT":
+        parser.error("--model-mode STRICT requires --narrative-mode STRICT")
+    cfg = BotConfig(allow_pm_session=args.allow_pm, narrative_mode=NarrativeMode(args.narrative_mode),
+                    model_mode=PlaybookMode(args.model_mode), structure_mode=StructureMode(args.structure_mode), discretion_mode=DiscretionMode(args.discretion_mode),
+                    regime_mode=RegimeMode(args.regime_mode), regime_require_calendar=args.require_calendar,
+                    enable_validated_wick_stop=args.validated_wick_stop,
+                    enabled_models=tuple(PlaybookModel(m) for m in args.models))
+    calendar = EconomicCalendar.from_csv(args.calendar) if args.calendar else None
+    if calendar is None:
+        print("WARNING: calendar required; STRICT regime blocks entries." if args.require_calendar else "WARNING: no news calendar supplied; news filters are inactive.", flush=True)
+    if args.live:
+        poll_live_yfinance(
+            cfg,
+            log_dir=args.log_dir,
+            poll_sec=args.poll_sec,
+            lookback_days=args.lookback_days,
+            once=args.once,
+            ny_hours_only=args.ny_hours_only,
+            max_minutes=args.max_minutes,
+            webhook_url=args.webhook,
+            calendar=calendar,
+        )
+        return
+    if not args.nq_csv or not args.es_csv:
+        parser.error('--nq-csv and --es-csv are required unless --live is set')
+    nq_bars = load_csv_bars(args.nq_csv, "NQ", "1m")
+    es_bars = load_csv_bars(args.es_csv, "ES", "1m")
+    run_paper_replay(nq_bars, es_bars, cfg, args.log_dir, pace_ms=args.pace_ms, webhook_url=args.webhook, calendar=calendar)
+
+
+if __name__ == "__main__":
+    main()
